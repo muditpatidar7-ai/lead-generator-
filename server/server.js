@@ -94,9 +94,31 @@ async function isCancelled(jobId) {
 async function requestCancel(jobId) {
   cancellationState.set(jobId, true);
   try {
-    await pool.query("UPDATE scrape_jobs SET cancel_requested = 1 WHERE id = ?", [jobId]);
+    await pool.query("UPDATE scrape_jobs SET cancel_requested = 1, current_step = 'Cancelling...' WHERE id = ?", [jobId]);
   } catch (err) {
     console.warn("Cancel flag update failed:", err.message);
+  }
+}
+
+async function runWithCancellation(jobId, task) {
+  let interval = null;
+  const cancelPromise = new Promise((_, reject) => {
+    interval = setInterval(async () => {
+      try {
+        if (await isCancelled(jobId)) {
+          clearInterval(interval);
+          reject(new Error("CANCELLED_BY_USER"));
+        }
+      } catch {
+        // ignore transient DB/read issues
+      }
+    }, 500);
+  });
+
+  try {
+    return await Promise.race([Promise.resolve().then(task), cancelPromise]);
+  } finally {
+    if (interval) clearInterval(interval);
   }
 }
 
@@ -279,11 +301,12 @@ async function scrapeViewport(browser, url, maxResults, onProgress, jobId) {
   let navigated = false;
   for (let attempt = 1; attempt <= 2 && !navigated; attempt++) {
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await runWithCancellation(jobId, () => page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 }));
       navigated = true;
     } catch (err) {
+      if (err.message === "CANCELLED_BY_USER") throw err;
       if (attempt === 2) throw err;
-      await new Promise((r) => setTimeout(r, 3000));
+      await runWithCancellation(jobId, () => new Promise((r) => setTimeout(r, 3000)));
     }
   }
 
@@ -295,11 +318,13 @@ async function scrapeViewport(browser, url, maxResults, onProgress, jobId) {
   }
   await dismissConsentIfPresent(page);
 
-  const feedOk = await page.waitForSelector('[role="feed"]', { timeout: 15000 }).then(() => true).catch(() => false);
+  const feedOk = await runWithCancellation(jobId, () =>
+    page.waitForSelector('[role="feed"]', { timeout: 15000 }).then(() => true).catch(() => false)
+  );
   if (!feedOk) {
     await dismissConsentIfPresent(page);
-    await page.reload({ waitUntil: "networkidle2", timeout: 40000 }).catch(() => {});
-    await page.waitForSelector('[role="feed"]', { timeout: 15000 }).catch(() => {});
+    await runWithCancellation(jobId, () => page.reload({ waitUntil: "networkidle2", timeout: 40000 }).catch(() => {}));
+    await runWithCancellation(jobId, () => page.waitForSelector('[role="feed"]', { timeout: 15000 }).catch(() => {}));
   }
 
   const leads = [];
@@ -319,11 +344,11 @@ async function scrapeViewport(browser, url, maxResults, onProgress, jobId) {
     // FIX: har 3 scroll-cycle me ek baar cancel-flag check karo —
     // lambi list wale viewport bhi jaldi rukein, cancel dabane ke baad.
     if (jobId && loopCount % 3 === 0 && (await isCancelled(jobId))) {
-      await page.close();
+      await page.close().catch(() => {});
       throw new Error("CANCELLED_BY_USER");
     }
 
-    const results = await page.evaluate(extractCardData);
+    const results = await runWithCancellation(jobId, () => page.evaluate(extractCardData));
     if (results.length > lastCount) {
       lastCount = results.length;
       stale = 0;
@@ -340,26 +365,26 @@ async function scrapeViewport(browser, url, maxResults, onProgress, jobId) {
       stale++;
     }
 
-    const reachedEnd = await page.evaluate(() => {
+    const reachedEnd = await runWithCancellation(jobId, () => page.evaluate(() => {
       const feed = document.querySelector('[role="feed"]');
       if (!feed) return false;
       return /you've reached the end of the list/i.test(feed.textContent || "");
-    });
+    }));
     if (reachedEnd) break;
 
-    await page.evaluate(() => {
+    await runWithCancellation(jobId, () => page.evaluate(() => {
       const feed = document.querySelector('[role="feed"]');
       if (feed) feed.scrollTop = feed.scrollHeight;
-    });
-    await new Promise((r) => setTimeout(r, 2800));
+    }));
+    await runWithCancellation(jobId, () => new Promise((r) => setTimeout(r, 2800)));
   }
 
-  await page.close();
+  await page.close().catch(() => {});
   return leads;
 }
 
 // Website + Instagram nikalne ke liye detail page kholta hai
-async function enrichLead(browser, lead) {
+async function enrichLead(browser, lead, jobId) {
   try {
     const page = await browser.newPage();
     await page.setRequestInterception(true);
@@ -373,25 +398,27 @@ async function enrichLead(browser, lead) {
       lead.placeUrl ||
       `https://www.google.com/maps/search/${encodeURIComponent(lead.name + " " + (lead.locationSuffix || ""))}`;
 
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 15000 });
-    await new Promise((r) => setTimeout(r, 1500));
+    await runWithCancellation(jobId, () => page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 15000 }));
+    await runWithCancellation(jobId, () => new Promise((r) => setTimeout(r, 1500)));
 
     if (!page.url().includes("/maps/place/")) {
       const first = await page.$('[role="feed"] > div:first-child a[href*="/maps/place/"]');
       if (first) {
-        await first.click();
-        await new Promise((r) => setTimeout(r, 2000));
+        await runWithCancellation(jobId, () => first.click());
+        await runWithCancellation(jobId, () => new Promise((r) => setTimeout(r, 2000)));
       }
     }
 
-    await page
-      .waitForSelector(
-        'button[data-tooltip="Copy phone number"], button[data-item-id^="phone"], a[data-item-id="authority"]',
-        { timeout: 6000 }
-      )
-      .catch(() => {});
+    await runWithCancellation(jobId, () =>
+      page
+        .waitForSelector(
+          'button[data-tooltip="Copy phone number"], button[data-item-id^="phone"], a[data-item-id="authority"]',
+          { timeout: 6000 }
+        )
+        .catch(() => {})
+    );
 
-    const data = await page.evaluate(() => {
+    const data = await runWithCancellation(jobId, () => page.evaluate(() => {
       const result = { phone: null, website: null };
 
       const phoneEl = document.querySelector('button[data-tooltip="Copy phone number"] div div:last-child');
@@ -412,7 +439,7 @@ async function enrichLead(browser, lead) {
       if (websiteEl) result.website = websiteEl.href;
 
       return result;
-    });
+    }));
 
     if (data.phone) lead.phone = data.phone.replace(/[^\d+]/g, "");
 
@@ -425,7 +452,7 @@ async function enrichLead(browser, lead) {
       }
     }
 
-    await page.close();
+    await page.close().catch(() => {});
   } catch {
     // skip, agla lead
   }
@@ -543,7 +570,7 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
       }
 
       allLeads[i].locationSuffix = locationSuffix;
-      await enrichLead(browser, allLeads[i]);
+      await enrichLead(browser, allLeads[i], jobId);
 
       if ((i + 1) % 5 === 0 || i === allLeads.length - 1) {
         await updateJob(jobId, { current_step: `Phone/Website nikala ja raha hai (${i + 1}/${allLeads.length})` });
