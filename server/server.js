@@ -34,6 +34,7 @@ const pool = mysql.createPool({
 });
 
 const cancellationState = new Map();
+const activeBrowsers = new Map();
 
 async function ensureSchema() {
   try {
@@ -94,9 +95,25 @@ async function isCancelled(jobId) {
 async function requestCancel(jobId) {
   cancellationState.set(jobId, true);
   try {
-    await pool.query("UPDATE scrape_jobs SET cancel_requested = 1, current_step = 'Cancelling...' WHERE id = ?", [jobId]);
+    await pool.query(
+      `UPDATE scrape_jobs
+       SET cancel_requested = 1,
+           status = 'cancelled',
+           current_step = 'Cancelling...',
+           finished_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND status NOT IN ('done', 'failed', 'cancelled')`,
+      [jobId]
+    );
   } catch (err) {
     console.warn("Cancel flag update failed:", err.message);
+  }
+
+  const browser = activeBrowsers.get(jobId);
+  if (browser) {
+    try {
+      await browser.close().catch(() => {});
+    } catch {}
+    activeBrowsers.delete(jobId);
   }
 }
 
@@ -469,6 +486,7 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
   try {
     await updateJob(jobId, { status: "running", current_step: "Browser launch ho raha hai" });
     browser = await launchBrowser();
+    activeBrowsers.set(jobId, browser);
 
     // FIX: Ab tak cancel-check sirf specific checkpoints (har 3 scroll,
     // har naya cell, har 5 leads) pe hota tha — agar job kisi lambi
@@ -667,7 +685,12 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
     }
   } finally {
     if (cancelWatchdog) clearInterval(cancelWatchdog);
-    if (browser) await browser.close().catch(() => {});
+    if (browser) {
+      try {
+        await browser.close().catch(() => {});
+      } catch {}
+      activeBrowsers.delete(jobId);
+    }
   }
 }
 
