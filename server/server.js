@@ -22,6 +22,9 @@ const MAX_LEADS_DEEP = parseInt(process.env.MAX_LEADS_DEEP || "1000");
 // Client usage cap — din me TOTAL kitni leads mil sakti hain (job count nahi,
 // kyunki ek job me kam leads milna client ki galti nahi hai)
 const DAILY_LEAD_LIMIT = parseInt(process.env.DAILY_LEAD_LIMIT || "2000");
+const DEEP_DEFAULT_GRID_SIZE = parseInt(process.env.DEEP_GRID_SIZE || "2");
+const DEEP_MAX_CELLS_PER_TERM = parseInt(process.env.DEEP_MAX_CELLS_PER_TERM || "4");
+const DEEP_MAX_CONCURRENCY = parseInt(process.env.DEEP_MAX_CONCURRENCY || "2");
 
 // -------- DB Connection (Hostinger ka MySQL, Remote MySQL ON hona chahiye) --------
 const pool = mysql.createPool({
@@ -518,48 +521,63 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
     if (mode === "deep") {
       await updateJob(jobId, { current_step: "City ka boundary nikala ja raha hai" });
       const bbox = await getCityBoundingBox(city);
-      const grid = bbox ? generateGrid(bbox, gridSize || 3) : [null];
-      await updateJob(jobId, { cells_total: grid.length * expansions.length });
+      const activeGridSize = Math.max(1, gridSize || DEEP_DEFAULT_GRID_SIZE);
+      const grid = bbox ? generateGrid(bbox, activeGridSize) : [null];
+      const maxCellsPerTerm = Math.max(1, Math.min(DEEP_MAX_CELLS_PER_TERM, grid.length));
+      const cellsToScan = grid.slice(0, maxCellsPerTerm);
+      await updateJob(jobId, { cells_total: cellsToScan.length * expansions.length });
 
       let cellsDone = 0;
       const seenGlobalKeys = new Set();
       outerLoop:
       for (const term of expansions) {
-        for (const cell of grid) {
+        for (let offset = 0; offset < cellsToScan.length; offset += DEEP_MAX_CONCURRENCY) {
           if (allLeads.length >= effectiveDeepCap) {
             await updateJob(jobId, { current_step: `Limit (${effectiveDeepCap}) pahunch gaya, ruk raha hai` });
             break outerLoop;
           }
 
-          // FIX: har cell shuru hone se pehle cancel-flag check karo,
-          // taaki "Cancel" dabane ke turant baad naya cell start na ho.
           if (await isCancelled(jobId)) {
             throw new Error("CANCELLED_BY_USER");
           }
 
-          const q = area ? `${term} in ${area}, ${city}` : `${term} in ${city}`;
-          const url = cell
-            ? `https://www.google.com/maps/search/${encodeURIComponent(term)}/@${cell.lat},${cell.lng},14z`
-            : `https://www.google.com/maps/search/${encodeURIComponent(q)}`;
+          const batch = cellsToScan.slice(offset, offset + DEEP_MAX_CONCURRENCY);
+          const batchResults = await Promise.all(
+            batch.map(async (cell, batchIndex) => {
+              if (await isCancelled(jobId)) {
+                throw new Error("CANCELLED_BY_USER");
+              }
 
-          await updateJob(jobId, { current_step: `Scanning: ${term} (cell ${cellsDone + 1})` });
+              const q = area ? `${term} in ${area}, ${city}` : `${term} in ${city}`;
+              const url = cell
+                ? `https://www.google.com/maps/search/${encodeURIComponent(term)}/@${cell.lat},${cell.lng},14z`
+                : `https://www.google.com/maps/search/${encodeURIComponent(q)}`;
 
-          const remaining = effectiveDeepCap - allLeads.length;
-          const leads = await scrapeViewport(browser, url, Math.min(120, remaining), async (count) => {
-            await updateJob(jobId, { total_found: allLeads.length + count, current_step: `${term}: ${count} mili` });
-          }, jobId);
+              const currentCellNo = cellsDone + batchIndex + 1;
+              await updateJob(jobId, { current_step: `Scanning: ${term} (cell ${currentCellNo})` });
 
-          for (const l of leads) {
-            if (allLeads.length >= effectiveDeepCap) break;
-            const key = leadKey(l);
-            if (!seenGlobalKeys.has(key)) {
-              seenGlobalKeys.add(key);
-              l.category = l.category || term;
-              allLeads.push(l);
+              const remaining = effectiveDeepCap - allLeads.length;
+              const leads = await scrapeViewport(browser, url, Math.min(120, remaining), async (count) => {
+                await updateJob(jobId, { total_found: allLeads.length + count, current_step: `${term}: ${count} mili` });
+              }, jobId);
+
+              return leads;
+            })
+          );
+
+          for (const leads of batchResults) {
+            for (const l of leads) {
+              if (allLeads.length >= effectiveDeepCap) break;
+              const key = leadKey(l);
+              if (!seenGlobalKeys.has(key)) {
+                seenGlobalKeys.add(key);
+                l.category = l.category || term;
+                allLeads.push(l);
+              }
             }
           }
 
-          cellsDone++;
+          cellsDone += batchResults.length;
           await updateJob(jobId, { cells_done: cellsDone, total_found: allLeads.length });
         }
       }
