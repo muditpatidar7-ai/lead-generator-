@@ -33,6 +33,26 @@ const pool = mysql.createPool({
   connectionLimit: 5,
 });
 
+const cancellationState = new Map();
+
+async function ensureSchema() {
+  try {
+    await pool.query(`ALTER TABLE scrape_jobs
+      ADD COLUMN IF NOT EXISTS cancel_requested TINYINT(1) NOT NULL DEFAULT 0`);
+  } catch (err) {
+    console.warn("Schema migration (cancel_requested) skipped:", err.message);
+  }
+
+  try {
+    await pool.query(`ALTER TABLE scrape_jobs
+      MODIFY COLUMN status ENUM('pending','running','done','failed','cancelled') NOT NULL DEFAULT 'pending'`);
+  } catch (err) {
+    console.warn("Schema migration (status enum) skipped:", err.message);
+  }
+}
+
+ensureSchema().catch((err) => console.warn("Schema ensure failed:", err.message));
+
 // -------- Dedup helpers --------
 // Normalize karta hai taaki chhoti spacing/case differences se
 // duplicate slip na ho. placeUrl available ho toh usi ko primary
@@ -57,13 +77,27 @@ async function updateJob(jobId, fields) {
   ]);
 }
 
-// FIX: Job ko beech me rokne ke liye — DB me flag check karte hain.
-// Har baar poll karna DB pe load daalta, isliye caller khud decide
-// karta hai kitni baar call karna hai (e.g. har cell/term ke baad,
-// ya scrapeViewport ke andar har kuch scroll cycles baad).
+// FIX: Job ko beech me rokne ke liye — DB me flag check karte hain,
+// aur agar DB schema abhi old hai to in-memory fallback use hota hai.
 async function isCancelled(jobId) {
-  const [rows] = await pool.query("SELECT cancel_requested FROM scrape_jobs WHERE id = ?", [jobId]);
-  return rows.length > 0 && rows[0].cancel_requested === 1;
+  if (cancellationState.get(jobId)) return true;
+
+  try {
+    const [rows] = await pool.query("SELECT cancel_requested, status FROM scrape_jobs WHERE id = ?", [jobId]);
+    if (!rows.length) return false;
+    return rows[0].cancel_requested === 1 || rows[0].status === "cancelled";
+  } catch {
+    return false;
+  }
+}
+
+async function requestCancel(jobId) {
+  cancellationState.set(jobId, true);
+  try {
+    await pool.query("UPDATE scrape_jobs SET cancel_requested = 1 WHERE id = ?", [jobId]);
+  } catch (err) {
+    console.warn("Cancel flag update failed:", err.message);
+  }
 }
 
 async function getCategoryExpansion(query) {
@@ -668,7 +702,8 @@ app.post("/api/scrape/cancel/:jobId", async (req, res) => {
   if (["done", "failed", "cancelled"].includes(rows[0].status)) {
     return res.status(400).json({ error: `Job already ${rows[0].status} hai, cancel nahi ho sakta` });
   }
-  await pool.query("UPDATE scrape_jobs SET cancel_requested = 1 WHERE id = ?", [req.params.jobId]);
+
+  await requestCancel(req.params.jobId);
   res.json({ message: "Cancel request bhej di gayi hai, job kuch second me rukega" });
 });
 
