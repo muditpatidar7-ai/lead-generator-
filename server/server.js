@@ -162,7 +162,8 @@ async function getCityBoundingBox(city) {
   // hone par) — us waqt .json() crash kar deta tha poore job ko.
   // Ab: (1) pehle DB cache check karo, (2) response.ok + content-type
   // verify karo JSON parse karne se pehle, (3) result DB me cache
-  // kar do taaki same city ke liye dobara Nominatim hit hi na ho.
+  // kar do taaki same city ke liye dobara Nominatim hit hi na ho,
+  // aur agar rate-limit ho to quietly fallback kar jaaye.
   try {
     const [cached] = await pool.query(
       "SELECT south, north, west, east FROM city_bbox_cache WHERE city = ? LIMIT 1",
@@ -180,41 +181,58 @@ async function getCityBoundingBox(city) {
     city
   )}&format=json&limit=1`;
 
-  let res;
-  try {
-    res = await fetch(url, {
-      headers: {
-        "User-Agent": "LeadScraperTool/1.0 (business lead scraper)",
-        Accept: "application/json",
-      },
-    });
-  } catch (err) {
-    throw new Error(`Nominatim ko request nahi bhej paye: ${err.message}`);
+  let lastError = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    let res;
+    try {
+      res = await fetch(url, {
+        headers: {
+          "User-Agent": "LeadScraperTool/1.0 (business lead scraper)",
+          Accept: "application/json",
+        },
+      });
+    } catch (err) {
+      lastError = err;
+      if (attempt === 3) break;
+      await new Promise((r) => setTimeout(r, 2000 * attempt));
+      continue;
+    }
+
+    const contentType = res.headers.get("content-type") || "";
+    if (res.ok && contentType.includes("application/json")) {
+      try {
+        const data = await res.json();
+        if (!data.length) return null;
+        const [south, north, west, east] = data[0].boundingbox.map(parseFloat);
+
+        try {
+          await pool.query(
+            `INSERT INTO city_bbox_cache (city, south, north, west, east) VALUES (?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE south = VALUES(south), north = VALUES(north), west = VALUES(west), east = VALUES(east)`,
+            [city.toLowerCase(), south, north, west, east]
+          );
+        } catch {
+          // caching fail ho jaye to bhi scrape rukna nahi chahiye
+        }
+
+        return { south, north, west, east };
+      } catch (err) {
+        lastError = err;
+      }
+    } else {
+      const text = await res.text().catch(() => "");
+      lastError = new Error(`Nominatim ne city boundary dene se mana kar diya (status ${res.status}): ${text.slice(0, 100)}`);
+    }
+
+    if (attempt < 3 && (lastError?.message || "").includes("status 429")) {
+      await new Promise((r) => setTimeout(r, 3000 * attempt));
+    } else if (attempt < 3) {
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
+    }
   }
 
-  const contentType = res.headers.get("content-type") || "";
-  if (!res.ok || !contentType.includes("application/json")) {
-    const text = await res.text().catch(() => "");
-    throw new Error(
-      `Nominatim ne city boundary dene se mana kar diya (status ${res.status}): ${text.slice(0, 100)}`
-    );
-  }
-
-  const data = await res.json();
-  if (!data.length) return null;
-  const [south, north, west, east] = data[0].boundingbox.map(parseFloat);
-
-  try {
-    await pool.query(
-      `INSERT INTO city_bbox_cache (city, south, north, west, east) VALUES (?, ?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE south = VALUES(south), north = VALUES(north), west = VALUES(west), east = VALUES(east)`,
-      [city.toLowerCase(), south, north, west, east]
-    );
-  } catch {
-    // caching fail ho jaye to bhi scrape rukna nahi chahiye
-  }
-
-  return { south, north, west, east };
+  console.warn(`City bbox unavailable for ${city}:`, lastError?.message || "unknown error");
+  return null;
 }
 
 function generateGrid(bbox, gridSize) {
@@ -520,7 +538,12 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
 
     if (mode === "deep") {
       await updateJob(jobId, { current_step: "City ka boundary nikala ja raha hai" });
-      const bbox = await getCityBoundingBox(city);
+      let bbox = null;
+      try {
+        bbox = await getCityBoundingBox(city);
+      } catch (err) {
+        console.warn("City bbox lookup failed, falling back to single city search:", err.message);
+      }
       const activeGridSize = Math.max(1, gridSize || DEEP_DEFAULT_GRID_SIZE);
       const grid = bbox ? generateGrid(bbox, activeGridSize) : [null];
       const maxCellsPerTerm = Math.max(1, Math.min(DEEP_MAX_CELLS_PER_TERM, grid.length));
