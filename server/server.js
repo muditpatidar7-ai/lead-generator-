@@ -71,15 +71,64 @@ async function getCategoryExpansion(query) {
 
 // -------- Geocoding (city bounding box, deep mode ke liye) --------
 async function getCityBoundingBox(city) {
+  // FIX: Pehle seedha Nominatim call karke .json() parse ho jaata tha,
+  // lekin Nominatim kabhi "Access denied" jaisa PLAIN TEXT bhi bhej
+  // deta hai (rate-limit / generic User-Agent / datacenter IP block
+  // hone par) — us waqt .json() crash kar deta tha poore job ko.
+  // Ab: (1) pehle DB cache check karo, (2) response.ok + content-type
+  // verify karo JSON parse karne se pehle, (3) result DB me cache
+  // kar do taaki same city ke liye dobara Nominatim hit hi na ho.
+  try {
+    const [cached] = await pool.query(
+      "SELECT south, north, west, east FROM city_bbox_cache WHERE city = ? LIMIT 1",
+      [city.toLowerCase()]
+    );
+    if (cached.length) {
+      const c = cached[0];
+      return { south: c.south, north: c.north, west: c.west, east: c.east };
+    }
+  } catch {
+    // cache table shayad abhi exist nahi karti, ignore aur aage badho
+  }
+
   const url = `https://nominatim.openstreetmap.org/search?city=${encodeURIComponent(
     city
   )}&format=json&limit=1`;
-  const res = await fetch(url, {
-    headers: { "User-Agent": "LeadScraperTool/1.0 (contact: you@example.com)" },
-  });
+
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: {
+        "User-Agent": "LeadScraperTool/1.0 (business lead scraper)",
+        Accept: "application/json",
+      },
+    });
+  } catch (err) {
+    throw new Error(`Nominatim ko request nahi bhej paye: ${err.message}`);
+  }
+
+  const contentType = res.headers.get("content-type") || "";
+  if (!res.ok || !contentType.includes("application/json")) {
+    const text = await res.text().catch(() => "");
+    throw new Error(
+      `Nominatim ne city boundary dene se mana kar diya (status ${res.status}): ${text.slice(0, 100)}`
+    );
+  }
+
   const data = await res.json();
   if (!data.length) return null;
   const [south, north, west, east] = data[0].boundingbox.map(parseFloat);
+
+  try {
+    await pool.query(
+      `INSERT INTO city_bbox_cache (city, south, north, west, east) VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE south = VALUES(south), north = VALUES(north), west = VALUES(west), east = VALUES(east)`,
+      [city.toLowerCase(), south, north, west, east]
+    );
+  } catch {
+    // caching fail ho jaye to bhi scrape rukna nahi chahiye
+  }
+
   return { south, north, west, east };
 }
 
