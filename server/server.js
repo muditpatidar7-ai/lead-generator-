@@ -588,21 +588,17 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
 
 // Naya scrape job start karo
 app.post("/api/scrape/start", async (req, res) => {
-  const { query, city, area } = req.body;
+  const { query, city, area, fullCity } = req.body;
   let { mode = "quick", gridSize = 3 } = req.body;
   if (!query || !city) return res.status(400).json({ error: "query aur city required hain" });
 
-  // FIX: "area" (chhoti locality) ek single Google search se cover ho
-  // jaata hai (~100-150 results ke andar), lekin poori "city" mein
-  // usse kahin zyada businesses hote hain — Google Maps ek search
-  // query pe kabhi bhi ~120 se zyada results nahi deta, scroll karo
-  // chahe jitna. Isliye jab sirf city diya ho (area blank ho), poori
-  // city cover karne ke liye deep grid-scan zaroori hai — chahe
-  // frontend se "quick" bhi aaya ho, yahan force override karo.
-  if (!area) {
+  // FIX: pehle "area blank ho to automatically deep force karo" wala
+  // logic tha — isse "quick" kabhi explicitly chalta hi nahi tha jab
+  // area na diya ho, jo confusing tha. Ab decision fully explicit hai:
+  // frontend "fullCity: true" bheje tabhi deep force hoga. Warna jo
+  // mode bheja gaya hai (quick/deep) wahi respect hoga, area ho ya na ho.
+  if (fullCity === true) {
     mode = "deep";
-    // Bada city ho to grid thoda fine rakho taaki har cell chhota ho
-    // aur Google ka per-search cap kam se kam hit ho.
     if (!req.body.gridSize) gridSize = 5;
   }
 
