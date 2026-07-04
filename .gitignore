@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+server/node_modules/
+
+# Environment files
+.env
+.env.*
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Build / cache artifacts
+coverage/
+dist/
+build/
+.cache/
+
+# PHP / web temporary files
+*.tmp
+*.temp
