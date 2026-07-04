@@ -106,6 +106,13 @@ function generateGrid(bbox, gridSize) {
 async function launchBrowser() {
   return puppeteer.launch({
     headless: "new",
+    // FIX (step 4): Render pe build-time aur runtime ke beech Chrome ka
+    // cache path kabhi kabhi match nahi karta, isliye executablePath
+    // explicitly resolve karo. Agar Render dashboard me
+    // PUPPETEER_EXECUTABLE_PATH env var set kiya ho to wahi use hoga,
+    // warna puppeteer.executablePath() apna khud-install kiya hua
+    // (postinstall wala) Chrome dhoondh lega.
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath(),
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
