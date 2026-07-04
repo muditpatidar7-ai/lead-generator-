@@ -215,7 +215,13 @@ async function scrapeViewport(browser, url, maxResults, onProgress) {
   let lastCount = 0;
   let stale = 0;
 
-  while (leads.length < maxResults && stale < 8) {
+  // FIX: pehle stale threshold (8) aur scroll wait (1800ms) bahut kam the —
+  // Google Maps ko naye results lazy-load karne me thoda time lagta hai,
+  // is wajah se list 20 (pehla default batch) pe hi ruk jaati thi.
+  // Threshold aur wait dono badhaye, aur "end of list" wala Google ka
+  // apna message bhi detect kar rahe hain taaki genuinely list khatam
+  // hone par turant ruk jaye (bina 15 stale cycles waste kiye).
+  while (leads.length < maxResults && stale < 15) {
     const results = await page.evaluate(extractCardData);
     if (results.length > lastCount) {
       lastCount = results.length;
@@ -232,11 +238,19 @@ async function scrapeViewport(browser, url, maxResults, onProgress) {
     } else {
       stale++;
     }
+
+    const reachedEnd = await page.evaluate(() => {
+      const feed = document.querySelector('[role="feed"]');
+      if (!feed) return false;
+      return /you've reached the end of the list/i.test(feed.textContent || "");
+    });
+    if (reachedEnd) break;
+
     await page.evaluate(() => {
       const feed = document.querySelector('[role="feed"]');
-      if (feed) feed.scrollTop += 1200;
+      if (feed) feed.scrollTop = feed.scrollHeight;
     });
-    await new Promise((r) => setTimeout(r, 1800));
+    await new Promise((r) => setTimeout(r, 2800));
   }
 
   await page.close();
@@ -452,8 +466,23 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
 
 // Naya scrape job start karo
 app.post("/api/scrape/start", async (req, res) => {
-  const { query, city, area, mode = "quick", gridSize = 3 } = req.body;
+  const { query, city, area } = req.body;
+  let { mode = "quick", gridSize = 3 } = req.body;
   if (!query || !city) return res.status(400).json({ error: "query aur city required hain" });
+
+  // FIX: "area" (chhoti locality) ek single Google search se cover ho
+  // jaata hai (~100-150 results ke andar), lekin poori "city" mein
+  // usse kahin zyada businesses hote hain — Google Maps ek search
+  // query pe kabhi bhi ~120 se zyada results nahi deta, scroll karo
+  // chahe jitna. Isliye jab sirf city diya ho (area blank ho), poori
+  // city cover karne ke liye deep grid-scan zaroori hai — chahe
+  // frontend se "quick" bhi aaya ho, yahan force override karo.
+  if (!area) {
+    mode = "deep";
+    // Bada city ho to grid thoda fine rakho taaki har cell chhota ho
+    // aur Google ka per-search cap kam se kam hit ho.
+    if (!req.body.gridSize) gridSize = 5;
+  }
 
   // -------- Daily usage limit check (total LEADS, na ki job count) --------
   const [usedRows] = await pool.query(
