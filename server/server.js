@@ -179,7 +179,28 @@ async function scrapeViewport(browser, url, maxResults, onProgress) {
   await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36");
   await page.setViewport({ width: 1280, height: 720 });
 
-  await page.goto(url, { waitUntil: "networkidle2", timeout: 40000 });
+  // FIX: "networkidle2" Google Maps pe kabhi reliably resolve nahi hota
+  // (background tiles/analytics calls chalte rehte hain), isliye ye
+  // navigation timeout deta rehta tha. "domcontentloaded" use karo —
+  // faster aur zyada reliable — aur ek retry bhi rakho slow network
+  // ya temporary Google-side slowness ke liye.
+  let navigated = false;
+  for (let attempt = 1; attempt <= 2 && !navigated; attempt++) {
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
+      navigated = true;
+    } catch (err) {
+      if (attempt === 2) throw err;
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+
+  // FIX: Agar Google ne block/CAPTCHA/consent-wall page pe bheja hai,
+  // to yahi pe pakad lo — warna aage feed selector dhoondhte hue
+  // silently fail hota rehta hai aur asli reason samajh nahi aata.
+  if (/\/sorry\//i.test(page.url())) {
+    throw new Error("Google ne temporary block/CAPTCHA page dikhaya (IP rate-limited lag raha hai)");
+  }
   await dismissConsentIfPresent(page);
 
   const feedOk = await page.waitForSelector('[role="feed"]', { timeout: 15000 }).then(() => true).catch(() => false);
