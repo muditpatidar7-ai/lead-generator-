@@ -404,9 +404,30 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
   // par catch block ko ye pata chal sake ab tak kitni leads mil chuki
   // thi, taaki wo discard na ho balki DB me save ho jaayen.
   let allLeads = [];
+  let cancelWatchdog = null;
   try {
     await updateJob(jobId, { status: "running", current_step: "Browser launch ho raha hai" });
     browser = await launchBrowser();
+
+    // FIX: Ab tak cancel-check sirf specific checkpoints (har 3 scroll,
+    // har naya cell, har 5 leads) pe hota tha — agar job kisi lambi
+    // operation (jaise page.goto, jo 60s tak wait kar sakta hai) me
+    // atka ho, to cancel button dabane ke baad bhi kaafi der (ya lagta
+    // hai "kaam nahi kar raha") kuch nahi hota tha. Ye watchdog har 4
+    // second background me DB check karta hai — cancel dikha to seedha
+    // browser hi force-close kar deta hai, jisse jo bhi operation chal
+    // rahi ho wo turant error de ke reject ho jaati hai (near-instant
+    // cancellation, chahe process kahin bhi atka ho).
+    cancelWatchdog = setInterval(async () => {
+      try {
+        if (await isCancelled(jobId)) {
+          clearInterval(cancelWatchdog);
+          if (browser) await browser.close().catch(() => {});
+        }
+      } catch {
+        // DB hiccup, agla interval try karega
+      }
+    }, 4000);
 
     const expansions = await getCategoryExpansion(query);
     const locationSuffix = area ? `${area}, ${city}` : city;
@@ -537,11 +558,15 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
       finished_at: new Date(),
     });
   } catch (err) {
-    // FIX: agar user ne cancel dabaya tha, to ise "failed" nahi
-    // "cancelled" maano, aur jo leads ab tak mil chuki thi unko
-    // discard karne ke jagah DB me save kar do (partial results
-    // better hain kuch na milne se).
-    if (err.message === "CANCELLED_BY_USER") {
+    // FIX: watchdog ab browser ko force-close karta hai jab cancel ho,
+    // isliye error message "CANCELLED_BY_USER" nahi bhi ho sakta —
+    // Puppeteer apna generic error dega (jaise "Protocol error",
+    // "Target closed", "Session closed"). Isliye sirf error message
+    // pe depend nahi karte, DB ka cancel_requested flag bhi check
+    // karte hain — dono me se koi bhi true ho to "cancelled" maano.
+    const wasCancelled = err.message === "CANCELLED_BY_USER" || (await isCancelled(jobId).catch(() => false));
+
+    if (wasCancelled) {
       let saved = 0;
       for (const lead of allLeads) {
         try {
@@ -580,9 +605,11 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
       await updateJob(jobId, { status: "failed", error_message: String(err.message || err), finished_at: new Date() });
     }
   } finally {
+    if (cancelWatchdog) clearInterval(cancelWatchdog);
     if (browser) await browser.close().catch(() => {});
   }
 }
+
 
 // -------- API Routes (PHP dashboard yahi call karega) --------
 
