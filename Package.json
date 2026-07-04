@@ -1,0 +1,17 @@
+{
+  "name": "lead-scraper-render",
+  "version": "1.0.0",
+  "description": "Puppeteer scraper API - runs on Render, writes to shared Hostinger MySQL",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mysql2": "^3.10.0",
+    "puppeteer": "^22.0.0",
+    "uuid": "^9.0.1"
+  }
+}
