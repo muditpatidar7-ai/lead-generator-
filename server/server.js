@@ -57,6 +57,15 @@ async function updateJob(jobId, fields) {
   ]);
 }
 
+// FIX: Job ko beech me rokne ke liye — DB me flag check karte hain.
+// Har baar poll karna DB pe load daalta, isliye caller khud decide
+// karta hai kitni baar call karna hai (e.g. har cell/term ke baad,
+// ya scrapeViewport ke andar har kuch scroll cycles baad).
+async function isCancelled(jobId) {
+  const [rows] = await pool.query("SELECT cancel_requested FROM scrape_jobs WHERE id = ?", [jobId]);
+  return rows.length > 0 && rows[0].cancel_requested === 1;
+}
+
 async function getCategoryExpansion(query) {
   const [rows] = await pool.query(
     "SELECT trigger_key, expansions FROM categories WHERE ? LIKE CONCAT('%', trigger_key, '%') LIMIT 1",
@@ -218,7 +227,7 @@ function extractCardData() {
 }
 
 // Ek viewport (single URL) ko poora scroll karke saari leads nikalta hai
-async function scrapeViewport(browser, url, maxResults, onProgress) {
+async function scrapeViewport(browser, url, maxResults, onProgress, jobId) {
   const page = await browser.newPage();
   await page.setRequestInterception(true);
   page.on("request", (req) => {
@@ -263,6 +272,7 @@ async function scrapeViewport(browser, url, maxResults, onProgress) {
   const seenKeys = new Set();
   let lastCount = 0;
   let stale = 0;
+  let loopCount = 0;
 
   // FIX: pehle stale threshold (8) aur scroll wait (1800ms) bahut kam the —
   // Google Maps ko naye results lazy-load karne me thoda time lagta hai,
@@ -271,6 +281,14 @@ async function scrapeViewport(browser, url, maxResults, onProgress) {
   // apna message bhi detect kar rahe hain taaki genuinely list khatam
   // hone par turant ruk jaye (bina 15 stale cycles waste kiye).
   while (leads.length < maxResults && stale < 15) {
+    loopCount++;
+    // FIX: har 3 scroll-cycle me ek baar cancel-flag check karo —
+    // lambi list wale viewport bhi jaldi rukein, cancel dabane ke baad.
+    if (jobId && loopCount % 3 === 0 && (await isCancelled(jobId))) {
+      await page.close();
+      throw new Error("CANCELLED_BY_USER");
+    }
+
     const results = await page.evaluate(extractCardData);
     if (results.length > lastCount) {
       lastCount = results.length;
@@ -382,6 +400,10 @@ async function enrichLead(browser, lead) {
 // -------- Main scrape orchestration --------
 async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap }) {
   let browser;
+  // FIX: allLeads ko try block se bahar hoist kiya hai — cancel hone
+  // par catch block ko ye pata chal sake ab tak kitni leads mil chuki
+  // thi, taaki wo discard na ho balki DB me save ho jaayen.
+  let allLeads = [];
   try {
     await updateJob(jobId, { status: "running", current_step: "Browser launch ho raha hai" });
     browser = await launchBrowser();
@@ -392,8 +414,6 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
     // Effective cap = jo bhi chhota ho, per-job limit ya baaki bacha hua daily quota
     const effectiveQuickCap = Math.max(0, Math.min(MAX_LEADS_QUICK, leadCap));
     const effectiveDeepCap = Math.max(0, Math.min(MAX_LEADS_DEEP, leadCap));
-
-    let allLeads = [];
 
     if (mode === "deep") {
       await updateJob(jobId, { current_step: "City ka boundary nikala ja raha hai" });
@@ -411,6 +431,12 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
             break outerLoop;
           }
 
+          // FIX: har cell shuru hone se pehle cancel-flag check karo,
+          // taaki "Cancel" dabane ke turant baad naya cell start na ho.
+          if (await isCancelled(jobId)) {
+            throw new Error("CANCELLED_BY_USER");
+          }
+
           const q = area ? `${term} in ${area}, ${city}` : `${term} in ${city}`;
           const url = cell
             ? `https://www.google.com/maps/search/${encodeURIComponent(term)}/@${cell.lat},${cell.lng},14z`
@@ -421,7 +447,7 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
           const remaining = effectiveDeepCap - allLeads.length;
           const leads = await scrapeViewport(browser, url, Math.min(120, remaining), async (count) => {
             await updateJob(jobId, { total_found: allLeads.length + count, current_step: `${term}: ${count} mili` });
-          });
+          }, jobId);
 
           for (const l of leads) {
             if (allLeads.length >= effectiveDeepCap) break;
@@ -446,7 +472,7 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
       await updateJob(jobId, { current_step: "Quick scan shuru", cells_total: 1 });
       allLeads = await scrapeViewport(browser, url, effectiveQuickCap, async (count) => {
         await updateJob(jobId, { total_found: count, current_step: `${count} mili...` });
-      });
+      }, jobId);
       await updateJob(jobId, { cells_done: 1 });
     }
 
@@ -454,6 +480,13 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
     await updateJob(jobId, { current_step: `Phone/Website nikala ja raha hai (0/${allLeads.length})` });
 
     for (let i = 0; i < allLeads.length; i++) {
+      // FIX: enrichment (jo sabse zyada time leta hai, ek-ek lead pe page
+      // khol ke) ke beech me bhi cancel-flag check karo — warna 500
+      // leads ka enrichment cancel dabane ke baad bhi chalte rehta.
+      if ((i + 1) % 5 === 0 && (await isCancelled(jobId))) {
+        throw new Error("CANCELLED_BY_USER");
+      }
+
       allLeads[i].locationSuffix = locationSuffix;
       await enrichLead(browser, allLeads[i]);
 
@@ -504,8 +537,48 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
       finished_at: new Date(),
     });
   } catch (err) {
-    console.error("Job failed:", err);
-    await updateJob(jobId, { status: "failed", error_message: String(err.message || err), finished_at: new Date() });
+    // FIX: agar user ne cancel dabaya tha, to ise "failed" nahi
+    // "cancelled" maano, aur jo leads ab tak mil chuki thi unko
+    // discard karne ke jagah DB me save kar do (partial results
+    // better hain kuch na milne se).
+    if (err.message === "CANCELLED_BY_USER") {
+      let saved = 0;
+      for (const lead of allLeads) {
+        try {
+          await pool.query(
+            `INSERT INTO leads (job_id, name, phone, website, instagram, address, category, rating, reviews, city, area, place_url)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              jobId,
+              lead.name,
+              lead.phone || null,
+              lead.website || null,
+              lead.instagram || null,
+              lead.address || null,
+              lead.category || query,
+              lead.rating || null,
+              lead.reviews || null,
+              city,
+              area || null,
+              lead.placeUrl || null,
+            ]
+          );
+          saved++;
+        } catch {
+          // duplicate ya koi issue, skip
+        }
+      }
+      await updateJob(jobId, {
+        status: "cancelled",
+        total_found: allLeads.length,
+        total_saved: saved,
+        current_step: "User ne cancel kiya (jo leads mili wo save ho gayi)",
+        finished_at: new Date(),
+      });
+    } else {
+      console.error("Job failed:", err);
+      await updateJob(jobId, { status: "failed", error_message: String(err.message || err), finished_at: new Date() });
+    }
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
@@ -563,6 +636,31 @@ app.get("/api/scrape/status/:jobId", async (req, res) => {
   const [rows] = await pool.query("SELECT * FROM scrape_jobs WHERE id = ?", [req.params.jobId]);
   if (!rows.length) return res.status(404).json({ error: "Job nahi mila" });
   res.json(rows[0]);
+});
+
+// Job ko cancel karo (PHP dashboard "Cancel" button se call karega)
+app.post("/api/scrape/cancel/:jobId", async (req, res) => {
+  const [rows] = await pool.query("SELECT status FROM scrape_jobs WHERE id = ?", [req.params.jobId]);
+  if (!rows.length) return res.status(404).json({ error: "Job nahi mila" });
+  if (["done", "failed", "cancelled"].includes(rows[0].status)) {
+    return res.status(400).json({ error: `Job already ${rows[0].status} hai, cancel nahi ho sakta` });
+  }
+  await pool.query("UPDATE scrape_jobs SET cancel_requested = 1 WHERE id = ?", [req.params.jobId]);
+  res.json({ message: "Cancel request bhej di gayi hai, job kuch second me rukega" });
+});
+
+// FIX: Tab switch/page reload hone par frontend ko pata nahi chalta
+// kaunsa job abhi running hai (jobId sirf JS memory me hota tha).
+// Ye endpoint sabse recent running/pending job return karta hai —
+// PHP dashboard page load hote hi isko call karke seedha usi job
+// ki polling resume kar sakta hai, chahe beech me kitni bhi der
+// tab band rakha ho ya switch kiya ho.
+app.get("/api/scrape/active", async (req, res) => {
+  const [rows] = await pool.query(
+    "SELECT * FROM scrape_jobs WHERE status IN ('pending', 'running') ORDER BY started_at DESC LIMIT 1"
+  );
+  if (!rows.length) return res.json({ active: false });
+  res.json({ active: true, job: rows[0] });
 });
 
 // Health check
