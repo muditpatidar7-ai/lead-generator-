@@ -16,16 +16,32 @@ app.use(cors());
 app.use(express.json());
 
 // -------- Limits (env se configure kar sakte ho, Render dashboard me) --------
+const LOW_MEMORY_MODE =
+  process.env.LOW_MEMORY_MODE === "true" ||
+  process.env.LOW_MEMORY_MODE === "1" ||
+  parseInt(process.env.MEMORY_LIMIT_MB || "0", 10) <= 512;
+
 // Per-job cap — ek scrape kitni leads tak jaaye (Google block/timeout se bachne ke liye)
-const MAX_LEADS_QUICK = parseInt(process.env.MAX_LEADS_QUICK || "200");
-const MAX_LEADS_DEEP = parseInt(process.env.MAX_LEADS_DEEP || "1000");
+const MAX_LEADS_QUICK = parseInt(process.env.MAX_LEADS_QUICK || (LOW_MEMORY_MODE ? "20" : "200"));
+const MAX_LEADS_DEEP = parseInt(process.env.MAX_LEADS_DEEP || (LOW_MEMORY_MODE ? "30" : "1000"));
 // Client usage cap — din me TOTAL kitni leads mil sakti hain (job count nahi,
 // kyunki ek job me kam leads milna client ki galti nahi hai)
-const DAILY_LEAD_LIMIT = parseInt(process.env.DAILY_LEAD_LIMIT || "2000");
-const DEEP_DEFAULT_GRID_SIZE = parseInt(process.env.DEEP_GRID_SIZE || "2");
-const DEEP_MAX_CELLS_PER_TERM = parseInt(process.env.DEEP_MAX_CELLS_PER_TERM || "4");
+const DAILY_LEAD_LIMIT = parseInt(process.env.DAILY_LEAD_LIMIT || (LOW_MEMORY_MODE ? "200" : "2000"));
+const DEEP_DEFAULT_GRID_SIZE = parseInt(process.env.DEEP_GRID_SIZE || (LOW_MEMORY_MODE ? "1" : "2"));
+const DEEP_MAX_CELLS_PER_TERM = parseInt(process.env.DEEP_MAX_CELLS_PER_TERM || (LOW_MEMORY_MODE ? "1" : "4"));
 const DEEP_MAX_CONCURRENCY = parseInt(process.env.DEEP_MAX_CONCURRENCY || "1");
-const ENABLE_DETAIL_EXTRACTION = process.env.ENABLE_DETAIL_EXTRACTION !== "false";
+const ENABLE_DETAIL_EXTRACTION = !LOW_MEMORY_MODE && process.env.ENABLE_DETAIL_EXTRACTION !== "false";
+const LOW_MEMORY_ARGS = LOW_MEMORY_MODE
+  ? [
+      "--single-process",
+      "--no-zygote",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-renderer-backgrounding",
+      "--disable-software-rasterizer",
+      "--memory-pressure-off",
+    ]
+  : [];
 
 // -------- DB Connection (Hostinger ka MySQL, Remote MySQL ON hona chahiye) --------
 const pool = mysql.createPool({
@@ -311,8 +327,13 @@ function generateGrid(bbox, gridSize) {
 // detached" jaisi crash errors deta hai. Linux/Render pe iski
 // zaroorat nahi thi, isliye hataana safe hai.
 async function launchBrowser() {
+  if (LOW_MEMORY_MODE) {
+    console.log("Low memory mode enabled: lighter browser limits and reduced scrape caps are active.");
+  }
+
   return puppeteer.launch({
     headless: "new",
+    timeout: 60000,
     // FIX (step 4): Render pe build-time aur runtime ke beech Chrome ka
     // cache path kabhi kabhi match nahi karta, isliye executablePath
     // explicitly resolve karo. Agar Render dashboard me
@@ -328,6 +349,8 @@ async function launchBrowser() {
       "--disable-extensions",
       "--mute-audio",
       "--lang=en-US,en",
+      "--disable-features=TranslateUI,BlinkGenPropertyTrees",
+      ...LOW_MEMORY_ARGS,
     ],
   });
 }

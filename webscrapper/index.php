@@ -94,6 +94,7 @@ $categories = $db->query("SELECT * FROM categories ORDER BY name")->fetchAll(PDO
         <div class="bar-outer"><div class="bar-inner" id="progressBar"></div></div>
         <div class="progress-count" id="progressCount"></div>
         <div id="historyNotice" style="margin-top:8px; color:var(--text-dim); font-size:13px;"></div>
+        <div id="etaNotice" style="margin-top:6px; color:var(--text-dim); font-size:13px;">Estimated time: slow mode, 5–15 mins depending on network and results.</div>
         <!-- NEW: Cancel button — sirf tab visible hoga jab koi job running/pending ho -->
         <button type="button" id="cancelBtn" class="btn btn-cancel" style="display:none; margin-top:12px;">
           Cancel Scraping
@@ -141,6 +142,7 @@ document.getElementById('scrapeForm').addEventListener('submit', async function(
 
   document.getElementById('startBtn').disabled = true;
   document.getElementById('historyNotice').textContent = '';
+  document.getElementById('etaNotice').textContent = 'Estimated time: slow mode, 5–15 mins depending on network and results.';
   const panel = document.getElementById('progress');
   panel.classList.remove('done', 'failed', 'cancelled');
   panel.style.display = 'block';
