@@ -32,8 +32,7 @@ fprintf($out, "\xEF\xBB\xBF");
 
 // Header row
 fputcsv($out, [
-    'Name', 'Phone', 'Website', 'Instagram', 'Address',
-    'Category', 'Rating', 'Reviews', 'City', 'Area', 'Google Maps Link', 'Scraped At'
+    'Name', 'Phone', 'Website', 'Instagram', 'Address'
 ]);
 
 foreach ($leads as $lead) {
@@ -43,13 +42,6 @@ foreach ($leads as $lead) {
         $lead['website'],
         $lead['instagram'],
         $lead['address'],
-        $lead['category'],
-        $lead['rating'],
-        $lead['reviews'],
-        $lead['city'],
-        $lead['area'],
-        $lead['place_url'],
-        $lead['scraped_at'],
     ]);
 }
 

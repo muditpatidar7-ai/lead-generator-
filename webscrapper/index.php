@@ -93,6 +93,7 @@ $categories = $db->query("SELECT * FROM categories ORDER BY name")->fetchAll(PDO
         </div>
         <div class="bar-outer"><div class="bar-inner" id="progressBar"></div></div>
         <div class="progress-count" id="progressCount"></div>
+        <div id="historyNotice" style="margin-top:8px; color:var(--text-dim); font-size:13px;"></div>
         <!-- NEW: Cancel button — sirf tab visible hoga jab koi job running/pending ho -->
         <button type="button" id="cancelBtn" class="btn btn-cancel" style="display:none; margin-top:12px;">
           Cancel Scraping
@@ -139,6 +140,7 @@ document.getElementById('scrapeForm').addEventListener('submit', async function(
   const mode = document.querySelector('input[name="mode"]:checked').value;
 
   document.getElementById('startBtn').disabled = true;
+  document.getElementById('historyNotice').textContent = '';
   const panel = document.getElementById('progress');
   panel.classList.remove('done', 'failed', 'cancelled');
   panel.style.display = 'block';
@@ -153,6 +155,9 @@ document.getElementById('scrapeForm').addEventListener('submit', async function(
 
   if (data.jobId) {
     currentJobId = data.jobId;
+    if (data.historyMessage) {
+      document.getElementById('historyNotice').textContent = data.historyMessage;
+    }
     cancelBtn.style.display = 'inline-block';
     pollStatus(data.jobId);
   } else {

@@ -24,7 +24,8 @@ const MAX_LEADS_DEEP = parseInt(process.env.MAX_LEADS_DEEP || "1000");
 const DAILY_LEAD_LIMIT = parseInt(process.env.DAILY_LEAD_LIMIT || "2000");
 const DEEP_DEFAULT_GRID_SIZE = parseInt(process.env.DEEP_GRID_SIZE || "2");
 const DEEP_MAX_CELLS_PER_TERM = parseInt(process.env.DEEP_MAX_CELLS_PER_TERM || "4");
-const DEEP_MAX_CONCURRENCY = parseInt(process.env.DEEP_MAX_CONCURRENCY || "2");
+const DEEP_MAX_CONCURRENCY = parseInt(process.env.DEEP_MAX_CONCURRENCY || "1");
+const ENABLE_DETAIL_EXTRACTION = process.env.ENABLE_DETAIL_EXTRACTION !== "false";
 
 // -------- DB Connection (Hostinger ka MySQL, Remote MySQL ON hona chahiye) --------
 const pool = mysql.createPool({
@@ -68,6 +69,60 @@ function normalize(str) {
 function leadKey(lead) {
   if (lead.placeUrl) return "url:" + lead.placeUrl.split("?")[0];
   return "na:" + normalize(lead.name) + "|" + normalize(lead.address);
+}
+
+async function leadAlreadyExists(lead, city, area) {
+  try {
+    if (lead.placeUrl) {
+      const [rows] = await pool.query("SELECT id FROM leads WHERE place_url = ? LIMIT 1", [lead.placeUrl.split("?")[0]]);
+      if (rows.length) return true;
+    }
+
+    const name = (lead.name || "").trim().toLowerCase();
+    const address = (lead.address || "").trim().toLowerCase();
+    if (!name && !address) return false;
+
+    const [rows] = await pool.query(
+      `SELECT id FROM leads
+       WHERE city = ? AND COALESCE(area, '') = COALESCE(?, '')
+         AND (
+           (LOWER(TRIM(name)) = ? AND LOWER(TRIM(address)) = ?)
+           OR (LOWER(TRIM(name)) = ?)
+         ) LIMIT 1`,
+      [city, area || null, name, address, name]
+    );
+    return rows.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function saveLeadRecord(jobId, lead, query, city, area) {
+  try {
+    if (await leadAlreadyExists(lead, city, area)) return false;
+
+    await pool.query(
+      `INSERT INTO leads (job_id, name, phone, website, instagram, address, category, rating, reviews, city, area, place_url)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        jobId,
+        lead.name,
+        lead.phone || null,
+        lead.website || null,
+        lead.instagram || null,
+        lead.address || null,
+        lead.category || query,
+        lead.rating || null,
+        lead.reviews || null,
+        city,
+        area || null,
+        lead.placeUrl || null,
+      ]
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // -------- Helpers --------
@@ -321,7 +376,7 @@ function extractCardData() {
 }
 
 // Ek viewport (single URL) ko poora scroll karke saari leads nikalta hai
-async function scrapeViewport(browser, url, maxResults, onProgress, jobId) {
+async function scrapeViewport(browser, url, maxResults, onProgress, jobId, onLeadDiscovered) {
   const page = await browser.newPage();
   await page.setRequestInterception(true);
   page.on("request", (req) => {
@@ -396,6 +451,11 @@ async function scrapeViewport(browser, url, maxResults, onProgress, jobId) {
         if (!seenKeys.has(key)) {
           seenKeys.add(key);
           leads.push(r);
+          if (onLeadDiscovered) {
+            try {
+              await onLeadDiscovered(r);
+            } catch {}
+          }
         }
       }
       if (onProgress) await onProgress(leads.length);
@@ -504,6 +564,7 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
   // thi, taaki wo discard na ho balki DB me save ho jaayen.
   let allLeads = [];
   let cancelWatchdog = null;
+  let savedCount = 0;
   try {
     await updateJob(jobId, { status: "running", current_step: "Browser launch ho raha hai" });
     browser = await launchBrowser();
@@ -582,7 +643,19 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
               const remaining = effectiveDeepCap - allLeads.length;
               const leads = await scrapeViewport(browser, url, Math.min(120, remaining), async (count) => {
                 await updateJob(jobId, { total_found: allLeads.length + count, current_step: `${term}: ${count} mili` });
-              }, jobId);
+              }, jobId, async (lead) => {
+                lead.locationSuffix = locationSuffix;
+                if (ENABLE_DETAIL_EXTRACTION) {
+                  try {
+                    await enrichLead(browser, lead, jobId);
+                  } catch {}
+                }
+                const inserted = await saveLeadRecord(jobId, lead, query, city, area);
+                if (inserted) {
+                  savedCount += 1;
+                  await updateJob(jobId, { total_saved: savedCount });
+                }
+              });
 
               return leads;
             })
@@ -613,67 +686,28 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
       await updateJob(jobId, { current_step: "Quick scan shuru", cells_total: 1 });
       allLeads = await scrapeViewport(browser, url, effectiveQuickCap, async (count) => {
         await updateJob(jobId, { total_found: count, current_step: `${count} mili...` });
-      }, jobId);
+      }, jobId, async (lead) => {
+        lead.locationSuffix = locationSuffix;
+        if (ENABLE_DETAIL_EXTRACTION) {
+          try {
+            await enrichLead(browser, lead, jobId);
+          } catch {}
+        }
+        const inserted = await saveLeadRecord(jobId, lead, query, city, area);
+        if (inserted) {
+          savedCount += 1;
+          await updateJob(jobId, { total_saved: savedCount });
+        }
+      });
       await updateJob(jobId, { cells_done: 1 });
     }
 
-    // -------- Enrichment: har lead ke liye phone + website/instagram --------
-    await updateJob(jobId, { current_step: `Phone/Website nikala ja raha hai (0/${allLeads.length})` });
-
-    for (let i = 0; i < allLeads.length; i++) {
-      // FIX: enrichment (jo sabse zyada time leta hai, ek-ek lead pe page
-      // khol ke) ke beech me bhi cancel-flag check karo — warna 500
-      // leads ka enrichment cancel dabane ke baad bhi chalte rehta.
-      if ((i + 1) % 5 === 0 && (await isCancelled(jobId))) {
-        throw new Error("CANCELLED_BY_USER");
-      }
-
-      allLeads[i].locationSuffix = locationSuffix;
-      await enrichLead(browser, allLeads[i], jobId);
-
-      if ((i + 1) % 5 === 0 || i === allLeads.length - 1) {
-        await updateJob(jobId, { current_step: `Phone/Website nikala ja raha hai (${i + 1}/${allLeads.length})` });
-      }
-
-      if ((i + 1) % 20 === 0 && i < allLeads.length - 1) {
-        await browser.close();
-        browser = await launchBrowser();
-      }
-    }
-
-    // -------- Save to DB --------
-    await updateJob(jobId, { current_step: "Database me save ho raha hai" });
-    let saved = 0;
-    for (const lead of allLeads) {
-      try {
-        await pool.query(
-          `INSERT INTO leads (job_id, name, phone, website, instagram, address, category, rating, reviews, city, area, place_url)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            jobId,
-            lead.name,
-            lead.phone || null,
-            lead.website || null,
-            lead.instagram || null,
-            lead.address || null,
-            lead.category || query,
-            lead.rating || null,
-            lead.reviews || null,
-            city,
-            area || null,
-            lead.placeUrl || null,
-          ]
-        );
-        saved++;
-      } catch {
-        // duplicate ya koi issue, skip
-      }
-    }
+    await updateJob(jobId, { current_step: "Leads collect ho rahe hain" });
 
     await updateJob(jobId, {
       status: "done",
       total_found: allLeads.length,
-      total_saved: saved,
+      total_saved: savedCount,
       current_step: "Complete",
       finished_at: new Date(),
     });
@@ -687,36 +721,10 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
     const wasCancelled = err.message === "CANCELLED_BY_USER" || (await isCancelled(jobId).catch(() => false));
 
     if (wasCancelled) {
-      let saved = 0;
-      for (const lead of allLeads) {
-        try {
-          await pool.query(
-            `INSERT INTO leads (job_id, name, phone, website, instagram, address, category, rating, reviews, city, area, place_url)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              jobId,
-              lead.name,
-              lead.phone || null,
-              lead.website || null,
-              lead.instagram || null,
-              lead.address || null,
-              lead.category || query,
-              lead.rating || null,
-              lead.reviews || null,
-              city,
-              area || null,
-              lead.placeUrl || null,
-            ]
-          );
-          saved++;
-        } catch {
-          // duplicate ya koi issue, skip
-        }
-      }
       await updateJob(jobId, {
         status: "cancelled",
         total_found: allLeads.length,
-        total_saved: saved,
+        total_saved: savedCount,
         current_step: "User ne cancel kiya (jo leads mili wo save ho gayi)",
         finished_at: new Date(),
       });
@@ -761,6 +769,13 @@ app.post("/api/scrape/start", async (req, res) => {
   const usedToday = usedRows[0].used;
   const remainingQuota = DAILY_LEAD_LIMIT - usedToday;
 
+  const [historyRows] = await pool.query(
+    `SELECT COUNT(*) AS cnt FROM scrape_jobs
+     WHERE category_query = ? AND city = ? AND COALESCE(area, '') = COALESCE(?, '') AND mode = ?`,
+    [query, city, area || null, mode]
+  );
+  const previousRuns = Number(historyRows[0].cnt || 0);
+
   if (remainingQuota <= 0) {
     return res.status(429).json({
       error: `Aaj ki lead limit (${DAILY_LEAD_LIMIT}) poori ho gayi (${usedToday} use ho chuki hain). Kal try karo.`,
@@ -776,7 +791,12 @@ app.post("/api/scrape/start", async (req, res) => {
   // Job background me chalao, response turant bhej do (PHP polling karega)
   runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap: remainingQuota });
 
-  res.json({ jobId, message: "Scrape job shuru ho gaya" });
+  res.json({
+    jobId,
+    message: "Scrape job shuru ho gaya",
+    historyCount: previousRuns,
+    historyMessage: previousRuns > 0 ? `Ye search pehle bhi ${previousRuns} baar ho chuki hai — history check karo.` : null,
+  });
 });
 
 // Job ka current status (PHP dashboard isko poll karega)

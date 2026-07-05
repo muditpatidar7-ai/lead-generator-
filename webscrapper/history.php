@@ -3,6 +3,14 @@ require_once 'config.php';
 $db = getDB();
 
 $selectedJob = $_GET['job'] ?? null;
+$deleteJob = $_POST['delete_job'] ?? null;
+
+if ($deleteJob) {
+    $stmt = $db->prepare("DELETE FROM scrape_jobs WHERE id = ?");
+    $stmt->execute([$deleteJob]);
+    header('Location: history.php');
+    exit;
+}
 
 $jobs = $db->query("SELECT * FROM scrape_jobs ORDER BY started_at DESC LIMIT 50")->fetchAll(PDO::FETCH_ASSOC);
 
@@ -90,6 +98,10 @@ function statusBadge($status) {
             <?php if ($job['total_saved'] > 0): ?>
               &nbsp;·&nbsp;<a class="link-pill" href="export-csv.php?job=<?= urlencode($job['id']) ?>">CSV</a>
             <?php endif; ?>
+            <form method="post" style="display:inline;" onsubmit="return confirm('Is job ko delete karna hai?');">
+              <input type="hidden" name="delete_job" value="<?= htmlspecialchars($job['id']) ?>">
+              <button type="submit" class="link-pill" style="border:none; background:none; color:var(--coral); cursor:pointer; padding:0;">Delete</button>
+            </form>
             <?php if (in_array($job['status'], ['pending', 'running'])): ?>
               &nbsp;·&nbsp;<a class="link-pill" href="index.php" style="color:var(--coral)">Running — cancel index.php se karo</a>
             <?php endif; ?>
@@ -110,8 +122,7 @@ function statusBadge($status) {
       <div class="card">
         <table class="data-table">
           <tr>
-            <th>Name</th><th>Phone</th><th>Website</th><th>Instagram</th>
-            <th>Address</th><th>Category</th><th>Rating</th><th>Reviews</th>
+            <th>Name</th><th>Phone</th><th>Website</th><th>Instagram</th><th>Address</th>
           </tr>
           <?php foreach ($leads as $lead): ?>
           <tr>
@@ -120,9 +131,6 @@ function statusBadge($status) {
             <td><?= $lead['website'] ? '<a class="link-pill" href="' . htmlspecialchars($lead['website']) . '" target="_blank">Link</a>' : '<span style="color:var(--text-faint)">-</span>' ?></td>
             <td><?= $lead['instagram'] ? '<a class="link-pill" href="' . htmlspecialchars($lead['instagram']) . '" target="_blank">Insta</a>' : '<span style="color:var(--text-faint)">-</span>' ?></td>
             <td style="color:var(--text-dim)"><?= htmlspecialchars($lead['address'] ?? '-') ?></td>
-            <td><?= htmlspecialchars($lead['category'] ?? '-') ?></td>
-            <td class="mono"><?= htmlspecialchars($lead['rating'] ?? '-') ?></td>
-            <td class="mono"><?= htmlspecialchars($lead['reviews'] ?? '-') ?></td>
           </tr>
           <?php endforeach; ?>
         </table>
