@@ -10,7 +10,7 @@ const express = require("express");
 const cors = require("cors");
 const mysql = require("mysql2/promise");
 const puppeteer = require("puppeteer-core");
-const chromium = require("@sparticuz/chromium");
+const chromium = require("@sparticuz/chromium").default;
 const { v4: uuidv4 } = require("uuid");
 
 const app = express();
@@ -337,11 +337,11 @@ async function launchBrowser() {
     console.log("Low memory mode enabled: lighter browser limits and reduced scrape caps are active.");
   }
 
-  const executablePath = chromium.path;
+  const executablePath = await chromium.executablePath();
   console.log("Launching browser with executable:", executablePath);
 
   return puppeteer.launch({
-    headless: chromium.headless,
+    headless: true,
     executablePath,
     defaultViewport: { width: 1280, height: 800 },
     timeout: 60000,
