@@ -148,23 +148,42 @@ document.getElementById('scrapeForm').addEventListener('submit', async function(
   panel.style.display = 'block';
   document.getElementById('progressText').textContent = 'Job shuru ho raha hai...';
 
-  const res = await fetch(RENDER_API + '/api/scrape/start', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, city, area, mode, gridSize: 3 })
-  });
-  const data = await res.json();
+  try {
+    const res = await fetch(RENDER_API + '/api/scrape/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, city, area, mode, gridSize: 3 })
+    });
 
-  if (data.jobId) {
-    currentJobId = data.jobId;
-    if (data.historyMessage) {
-      document.getElementById('historyNotice').textContent = data.historyMessage;
+    let data = {};
+    const contentType = res.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      data = await res.json();
+    } else {
+      const text = await res.text();
+      throw new Error(text || 'Backend se valid response nahi mila');
     }
-    cancelBtn.style.display = 'inline-block';
-    pollStatus(data.jobId);
-  } else {
-    document.getElementById('progressText').textContent = 'Error: ' + (data.error || 'Job start nahi hua');
+
+    if (!res.ok) {
+      throw new Error(data.error || 'Job start nahi ho saka');
+    }
+
+    if (data.jobId) {
+      currentJobId = data.jobId;
+      if (data.historyMessage) {
+        document.getElementById('historyNotice').textContent = data.historyMessage;
+      }
+      cancelBtn.style.display = 'inline-block';
+      pollStatus(data.jobId);
+    } else {
+      throw new Error(data.error || 'Job start nahi hua');
+    }
+  } catch (err) {
+    const panel = document.getElementById('progress');
+    panel.classList.add('failed');
+    document.getElementById('progressText').textContent = 'Error: ' + (err.message || 'Backend se connect nahi ho pa raha');
     document.getElementById('startBtn').disabled = false;
+    cancelBtn.style.display = 'none';
   }
 });
 
@@ -195,39 +214,51 @@ cancelBtn.addEventListener('click', async function() {
 function pollStatus(jobId) {
   currentJobId = jobId;
   pollTimer = setInterval(async () => {
-    const res = await fetch(RENDER_API + '/api/scrape/status/' + jobId);
-    const job = await res.json();
+    try {
+      const res = await fetch(RENDER_API + '/api/scrape/status/' + jobId);
+      if (!res.ok) {
+        throw new Error('Status check fail');
+      }
+      const job = await res.json();
 
-    document.getElementById('progressText').textContent = job.current_step || job.status;
-    document.getElementById('progressCount').textContent =
-      `${job.total_found || 0} leads mili · Cells: ${job.cells_done || 0}/${job.cells_total || 1}`;
+      document.getElementById('progressText').textContent = job.current_step || job.status;
+      document.getElementById('progressCount').textContent =
+        `${job.total_found || 0} leads mili · Cells: ${job.cells_done || 0}/${job.cells_total || 1}`;
 
-    const pct = job.cells_total ? Math.round((job.cells_done / job.cells_total) * 100) : 0;
-    document.getElementById('progressBar').style.width = pct + '%';
+      const pct = job.cells_total ? Math.round((job.cells_done / job.cells_total) * 100) : 0;
+      document.getElementById('progressBar').style.width = pct + '%';
 
-    const panel = document.getElementById('progress');
+      const panel = document.getElementById('progress');
 
-    // NEW: 'cancelled' status ko bhi 'done'/'failed' ki tarah terminal maana
-    if (job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') {
+      if (job.status === 'done' || job.status === 'failed' || job.status === 'cancelled') {
+        clearInterval(pollTimer);
+        document.getElementById('startBtn').disabled = false;
+        cancelBtn.style.display = 'none';
+        currentJobId = null;
+
+        if (job.status === 'done') {
+          panel.classList.add('done');
+          document.getElementById('progressText').textContent =
+            `Done — ${job.total_saved} leads save hui.`;
+          setTimeout(() => window.location.href = 'history.php?job=' + jobId, 1500);
+        } else if (job.status === 'cancelled') {
+          panel.classList.add('cancelled');
+          document.getElementById('progressText').textContent =
+            `Cancelled — ${job.total_saved || 0} leads save ho chuki thi cancel hone tak.`;
+          setTimeout(() => window.location.href = 'history.php?job=' + jobId, 1500);
+        } else {
+          panel.classList.add('failed');
+          document.getElementById('progressText').textContent = 'Failed: ' + job.error_message;
+        }
+      }
+    } catch (err) {
       clearInterval(pollTimer);
+      const panel = document.getElementById('progress');
+      panel.classList.add('failed');
+      document.getElementById('progressText').textContent = 'Error: ' + (err.message || 'Backend se connect nahi ho pa raha');
       document.getElementById('startBtn').disabled = false;
       cancelBtn.style.display = 'none';
       currentJobId = null;
-
-      if (job.status === 'done') {
-        panel.classList.add('done');
-        document.getElementById('progressText').textContent =
-          `Done — ${job.total_saved} leads save hui.`;
-        setTimeout(() => window.location.href = 'history.php?job=' + jobId, 1500);
-      } else if (job.status === 'cancelled') {
-        panel.classList.add('cancelled');
-        document.getElementById('progressText').textContent =
-          `Cancelled — ${job.total_saved || 0} leads save ho chuki thi cancel hone tak.`;
-        setTimeout(() => window.location.href = 'history.php?job=' + jobId, 1500);
-      } else {
-        panel.classList.add('failed');
-        document.getElementById('progressText').textContent = 'Failed: ' + job.error_message;
-      }
     }
   }, 3000);
 }

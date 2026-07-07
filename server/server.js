@@ -5,6 +5,7 @@
 // PHP side sirf usi DB ko poll karke dikhata hai.
 // ============================================
 require("dotenv").config();
+const fs = require("fs");
 const express = require("express");
 const cors = require("cors");
 const mysql = require("mysql2/promise");
@@ -46,8 +47,8 @@ const LOW_MEMORY_ARGS = LOW_MEMORY_MODE
 // -------- DB Connection (Hostinger ka MySQL, Remote MySQL ON hona chahiye) --------
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
+  user: process.env.DB_USER || process.env.DB_USERNAME,
+  password: process.env.DB_PASSWORD || process.env.DB_PASS,
   database: process.env.DB_NAME,
   waitForConnections: true,
   connectionLimit: 5,
@@ -321,6 +322,24 @@ function generateGrid(bbox, gridSize) {
   return cells;
 }
 
+function resolveChromeExecutable() {
+  const candidates = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    process.env.CHROME_BIN,
+    process.env.GOOGLE_CHROME_BIN,
+    process.env.CHROMIUM_BIN,
+    process.env.CHROMIUM_PATH,
+    puppeteer.executablePath(),
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (fs.existsSync(candidate)) return candidate;
+  }
+
+  return puppeteer.executablePath();
+}
+
 // -------- Browser launch --------
 // NOTE: --single-process hataya gaya hai — yeh flag Windows pe
 // Chrome ko unstable bana deta hai aur "Navigating frame was
@@ -331,16 +350,15 @@ async function launchBrowser() {
     console.log("Low memory mode enabled: lighter browser limits and reduced scrape caps are active.");
   }
 
+  const chromeExecutablePath = resolveChromeExecutable();
+  console.log("Launching browser with executable:", chromeExecutablePath);
+
   return puppeteer.launch({
     headless: "new",
     timeout: 60000,
-    // FIX (step 4): Render pe build-time aur runtime ke beech Chrome ka
-    // cache path kabhi kabhi match nahi karta, isliye executablePath
-    // explicitly resolve karo. Agar Render dashboard me
-    // PUPPETEER_EXECUTABLE_PATH env var set kiya ho to wahi use hoga,
-    // warna puppeteer.executablePath() apna khud-install kiya hua
-    // (postinstall wala) Chrome dhoondh lega.
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || puppeteer.executablePath(),
+    // FIX: Render/Hostinger-style deployments me Chrome path env ya
+    // auto-detected install path se resolve hota hai.
+    executablePath: chromeExecutablePath,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
