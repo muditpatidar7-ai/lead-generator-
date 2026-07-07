@@ -1,6 +1,6 @@
 // ============================================
 // Scraper API - Express + puppeteer-core + @sparticuz/chromium
-// FIXED VERSION - see FIXES.md style comments marked with "// FIX:"
+// FIXED VERSION v2 - see FIX2: comments for what changed this round
 // ============================================
 require('dotenv').config();
 const fs = require('fs');
@@ -36,15 +36,24 @@ const ENABLE_DETAIL_EXTRACTION =
   process.env.ENABLE_DETAIL_EXTRACTION === 'false'
     ? false
     : true;
+
+// FIX2: `--single-process` and `--no-zygote` REMOVED.
+// These merge the browser + renderer into a single OS process. On both
+// Render's free tier AND on shared/business Node hosting (Hostinger etc.),
+// this mode is inherently unstable with @sparticuz/chromium — any hiccup
+// (a slow page, a GC pause, a bad Google Maps DOM state) can take down the
+// whole Chromium instance instantly, which Puppeteer surfaces as the vague
+// "Protocol error (Target.setDiscoverTargets): Target closed" error you saw,
+// with 0 leads and cells stuck at 0/1 (crashed before the first cell finished).
+// Removing these two flags is the single biggest stability fix here.
 const LOW_MEMORY_ARGS = LOW_MEMORY_MODE
   ? [
-      '--single-process',
-      '--no-zygote',
       '--disable-background-timer-throttling',
       '--disable-backgrounding-occluded-windows',
       '--disable-renderer-backgrounding',
       '--disable-software-rasterizer',
       '--memory-pressure-off',
+      '--js-flags=--max-old-space-size=256',
     ]
   : [];
 
@@ -240,7 +249,7 @@ async function launchBrowser() {
     })();
   }
   const executablePath = await global.__chromiumExtractionPromise;
-  return puppeteer.launch({
+  const browser = await puppeteer.launch({
     headless: true,
     executablePath,
     defaultViewport: { width: 1280, height: 800 },
@@ -258,6 +267,22 @@ async function launchBrowser() {
       ...LOW_MEMORY_ARGS,
     ],
   });
+
+  // FIX2: log the REAL crash reason instead of letting it surface only as
+  // "Protocol error: Target closed" three layers up. If it's an OOM kill you'll
+  // see signal=SIGKILL; if Chromium itself faulted you'll see a non-zero exit
+  // code. This tells us definitively whether it's a memory issue or something else.
+  browser.on('disconnected', () => {
+    console.error('[chromium] browser disconnected unexpectedly (crash or manual close)');
+  });
+  const proc = browser.process();
+  if (proc) {
+    proc.on('exit', (code, signal) => {
+      console.error(`[chromium] process exited — code=${code} signal=${signal}`);
+    });
+  }
+
+  return browser;
 }
 
 async function dismissConsentIfPresent(page) {
@@ -298,6 +323,12 @@ async function scrapeViewport(browser, url, maxResults, onProgress, jobId, onLea
   page.on('request', (req) => { if (['image','stylesheet','font','media'].includes(req.resourceType())) req.abort(); else req.continue(); });
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36');
   await page.setViewport({ width: 1280, height: 720 });
+
+  // FIX2: surface page-level crashes (renderer OOM/crash for THIS tab specifically)
+  // instead of letting them bubble up as an opaque Target-closed error later.
+  page.on('error', (err) => console.error('[page] crashed:', err && err.message));
+  page.on('pageerror', (err) => console.error('[page] uncaught exception in page:', err && err.message));
+
   let navigated = false;
   for (let attempt = 1; attempt <= 2 && !navigated; attempt++) {
     try { await runWithCancellation(jobId, () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 })); navigated = true; } catch (err) { if (err.message === 'CANCELLED_BY_USER') throw err; if (attempt === 2) throw err; await runWithCancellation(jobId, () => new Promise(r => setTimeout(r, 3000))); }
@@ -384,8 +415,6 @@ async function enrichLead(browser, lead, jobId) {
         });
       };
 
-      // FIX: removed the stray leading "+" that was accidentally left in front of
-      // this line (looked like a copy-pasted diff hunk marker, not valid intent).
       const phoneControls = Array.from(document.querySelectorAll('a[href^="tel:"], button[aria-label*="Phone"], button[data-tooltip*="phone"], div[aria-label*="Phone"], span[aria-label*="Phone"], button[data-item-id^="phone"]'));
       for (const el of phoneControls) {
         try {
@@ -503,7 +532,10 @@ async function runScrapeJob({ jobId, query, city, area, mode, gridSize, leadCap 
     if (wasCancelled) {
       await updateJob(jobId, { status: 'cancelled', total_found: allLeads.length, total_saved: savedCount, current_step: 'User ne cancel kiya (jo leads mili wo save ho gayi)', finished_at: new Date() });
     } else {
-      console.error('Job failed:', err && err.message ? err.message : err);
+      // FIX2: log the full stack trace, not just err.message, so the actual
+      // failure point (which line, which call) is visible in Hostinger logs
+      // instead of just the generic Puppeteer wrapper message.
+      console.error('Job failed:', err && err.stack ? err.stack : err);
       await updateJob(jobId, { status: 'failed', error_message: String(err && err.message ? err.message : err), finished_at: new Date() });
     }
   } finally {
