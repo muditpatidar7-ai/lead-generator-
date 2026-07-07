@@ -345,22 +345,52 @@ async function enrichLead(browser, lead, jobId) {
     await runWithCancellation(jobId, () => page.waitForSelector('button[data-tooltip="Copy phone number"], button[data-item-id^="phone"], a[data-item-id="authority"]', { timeout: 6000 }).catch(()=>{}));
 
     const data = await runWithCancellation(jobId, () => page.evaluate(() => {
-      const result = { phone: null, website: null, instagram: null };
-      const phoneRegex = /(\+?\d[\d\-()\s]{6,}\d)/;
-      const tryPhoneFrom = (el) => { if (!el) return null; if (el.href && el.href.startsWith('tel:')) return el.href.replace(/^tel:/, ''); const cand = (el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('data-tooltip'))) || el.textContent || ''; const m = cand.match(phoneRegex); return m ? m[1].replace(/[^+\d]/g, '') : null; };
-      const phoneSelectors = ['button[data-tooltip^="Copy phone"]', 'button[data-item-id^="phone"]', 'button[aria-label*="Phone"]', 'a[href^="tel:"]'];
-      for (const sel of phoneSelectors) { const el = document.querySelector(sel); const p = tryPhoneFrom(el); if (p) { result.phone = p; break; } }
-      if (!result.phone) { const textNodes = Array.from(document.querySelectorAll('div, span, p, li')); for (const node of textNodes) { const txt = (node.textContent || '').trim(); const m = txt.match(phoneRegex); if (m && txt.length < 80) { result.phone = m[1].replace(/[^+\d]/g, ''); break; } } }
-      const websiteCandidates = []; const authority = document.querySelector('a[data-item-id="authority"]'); if (authority && authority.href) websiteCandidates.push(authority.href);
+      const phoneRegex = /(\+?\d[\d\-()\s]{6,}\d)/g;
+      const result = { phoneCandidates: [], websiteCandidates: [], instagramCandidates: [] };
+
+      // collect phone candidates from known controls and visible text
+      const controls = Array.from(document.querySelectorAll('button, a, div, span'));
+      for (const el of controls) {
+        try {
+          if (el.href && el.href.startsWith('tel:')) result.phoneCandidates.push(el.href.replace(/^tel:/, '').replace(/[^+\d]/g, ''));
+        } catch (e) {}
+        const text = (el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('data-tooltip'))) || el.textContent || '';
+        const m = text.match(phoneRegex);
+        if (m) for (const mm of m) result.phoneCandidates.push(mm.replace(/[^+\d]/g, ''));
+      }
+
+      // collect website anchors
       const anchors = Array.from(document.querySelectorAll('a[href^="http"]'));
-      for (const a of anchors) { const href = a.href; if (/google\.|maps\.app/.test(href)) continue; if (/^https?:\/\/(accounts|policies)\./.test(href)) continue; websiteCandidates.push(href); }
-      for (const w of websiteCandidates) { if (!w) continue; if (/instagram\.com/i.test(w)) { result.instagram = w; break; } result.website = w; break; }
+      for (const a of anchors) {
+        const href = a.href;
+        if (/google\.|maps\.app|accounts\.|policies\./i.test(href)) continue;
+        result.websiteCandidates.push(href);
+        if (/instagram\.com/i.test(href)) result.instagramCandidates.push(href);
+      }
+
+      // also look for meta tags/link rel that hint at website
+      const linkRel = document.querySelector('link[rel="canonical"]')?.href || document.querySelector('meta[property="og:url"]')?.content || null;
+      if (linkRel && !/google\./i.test(linkRel)) result.websiteCandidates.unshift(linkRel);
+
       return result;
     }));
 
-    if (data.phone) lead.phone = data.phone.replace(/[^\d+]/g, '');
-    if (data.instagram) lead.instagram = data.instagram;
-    else if (data.website) { if (/instagram\.com/i.test(data.website)) lead.instagram = data.website; else lead.website = data.website; }
+    // pick best phone candidate
+    if (data.phoneCandidates && data.phoneCandidates.length) {
+      lead.phone = data.phoneCandidates[0];
+    }
+
+    // pick website or instagram
+    if (data.instagramCandidates && data.instagramCandidates.length) {
+      lead.instagram = data.instagramCandidates[0];
+    } else if (data.websiteCandidates && data.websiteCandidates.length) {
+      lead.website = data.websiteCandidates[0];
+    }
+
+    if (!lead.phone && (!lead.website && !lead.instagram)) {
+      console.log(`enrichLead: no phone/website/instagram for job=${jobId} name=${lead.name} url=${page.url()}`);
+      console.log('candidates:', { phones: data.phoneCandidates && data.phoneCandidates.slice(0,5), websites: data.websiteCandidates && data.websiteCandidates.slice(0,5), instas: data.instagramCandidates && data.instagramCandidates.slice(0,5) });
+    }
     await page.close().catch(()=>{});
   } catch (e) {
     try { if (page) await page.close().catch(()=>{}); } catch {}
