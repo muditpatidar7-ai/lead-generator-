@@ -13,7 +13,7 @@ define('DB_HOST', getenv('DB_HOST') ?: ($_ENV['DB_HOST'] ?? 'localhost'));
 define('DB_NAME', getenv('DB_NAME') ?: ($_ENV['DB_NAME'] ?? 'scraper_db'));
 define('DB_USER', getenv('DB_USER') ?: ($_ENV['DB_USER'] ?? 'root'));
 define('DB_PASS', getenv('DB_PASS') ?: ($_ENV['DB_PASS'] ?? ''));
-define('RENDER_API_URL', getenv('RENDER_API_URL') ?: ($_ENV['RENDER_API_URL'] ?? 'https://your-node-app-url'));
+define('RENDER_API_URL', rtrim((string) (getenv('RENDER_API_URL') ?: ($_ENV['RENDER_API_URL'] ?? 'https://your-node-app-url')), '/'));
 
 function getDB() {
     static $pdo = null;

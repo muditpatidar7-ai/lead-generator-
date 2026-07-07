@@ -113,7 +113,13 @@ if (menuBtn) {
   overlay.addEventListener('click', () => { sidebar.classList.remove('open'); overlay.classList.remove('open'); });
 }
 
-const RENDER_API = "<?= RENDER_API_URL ?>";
+const RENDER_API = "<?= rtrim(RENDER_API_URL, '/') ?>";
+
+function ensureBackendConfigured() {
+  if (!RENDER_API || RENDER_API.includes('your-node-app-url')) {
+    throw new Error('Backend URL set nahi hai. config.php me RENDER_API_URL ko apne Node app ka real URL de do.');
+  }
+}
 
 document.getElementById('query').addEventListener('change', function() {
   document.getElementById('customQuery').style.display = this.value === '__custom__' ? 'block' : 'none';
@@ -149,6 +155,8 @@ document.getElementById('scrapeForm').addEventListener('submit', async function(
   document.getElementById('progressText').textContent = 'Job shuru ho raha hai...';
 
   try {
+    ensureBackendConfigured();
+
     const res = await fetch(RENDER_API + '/api/scrape/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -215,6 +223,8 @@ function pollStatus(jobId) {
   currentJobId = jobId;
   pollTimer = setInterval(async () => {
     try {
+      ensureBackendConfigured();
+
       const res = await fetch(RENDER_API + '/api/scrape/status/' + jobId);
       if (!res.ok) {
         throw new Error('Status check fail');
@@ -267,6 +277,8 @@ function pollStatus(jobId) {
 // isse tab switch/reload karne par bhi progress dobara dikh jaayegi, khoti nahi jaayegi.
 async function resumeActiveJobIfAny() {
   try {
+    ensureBackendConfigured();
+
     const res = await fetch(RENDER_API + '/api/scrape/active');
     const data = await res.json();
     if (data.active && data.job) {

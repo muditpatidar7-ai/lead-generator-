@@ -9,12 +9,19 @@ const fs = require("fs");
 const express = require("express");
 const cors = require("cors");
 const mysql = require("mysql2/promise");
-const puppeteer = require("puppeteer");
+const puppeteer = require("puppeteer-core");
+const chromium = require("@sparticuz/chromium");
 const { v4: uuidv4 } = require("uuid");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use((req, res, next) => {
+  if (req.url.includes("//")) {
+    req.url = req.url.replace(/\/+/g, "/");
+  }
+  next();
+});
 
 // -------- Limits (env se configure kar sakte ho, Render dashboard me) --------
 const LOW_MEMORY_MODE =
@@ -322,44 +329,24 @@ function generateGrid(bbox, gridSize) {
   return cells;
 }
 
-function resolveChromeExecutable() {
-  const candidates = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-    process.env.CHROME_BIN,
-    process.env.GOOGLE_CHROME_BIN,
-    process.env.CHROMIUM_BIN,
-    process.env.CHROMIUM_PATH,
-    puppeteer.executablePath(),
-  ];
-
-  for (const candidate of candidates) {
-    if (!candidate) continue;
-    if (fs.existsSync(candidate)) return candidate;
-  }
-
-  return puppeteer.executablePath();
-}
-
 // -------- Browser launch --------
-// NOTE: --single-process hataya gaya hai — yeh flag Windows pe
-// Chrome ko unstable bana deta hai aur "Navigating frame was
-// detached" jaisi crash errors deta hai. Linux/Render pe iski
-// zaroorat nahi thi, isliye hataana safe hai.
+// Render container environment me system Chrome nahi hota.
+// @sparticuz/chromium package bundled Chromium binary provide karta hai.
 async function launchBrowser() {
   if (LOW_MEMORY_MODE) {
     console.log("Low memory mode enabled: lighter browser limits and reduced scrape caps are active.");
   }
 
-  const chromeExecutablePath = resolveChromeExecutable();
-  console.log("Launching browser with executable:", chromeExecutablePath);
+  const executablePath = chromium.path;
+  console.log("Launching browser with executable:", executablePath);
 
   return puppeteer.launch({
-    headless: "new",
+    headless: chromium.headless,
+    executablePath,
+    defaultViewport: { width: 1280, height: 800 },
     timeout: 60000,
-    // FIX: Render/Hostinger-style deployments me Chrome path env ya
-    // auto-detected install path se resolve hota hai.
-    executablePath: chromeExecutablePath,
     args: [
+      ...chromium.args,
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
