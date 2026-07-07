@@ -25,14 +25,17 @@ app.use((req, res, next) => {
 const LOW_MEMORY_MODE =
   process.env.LOW_MEMORY_MODE === 'true' ||
   process.env.LOW_MEMORY_MODE === '1' ||
-  parseInt(process.env.MEMORY_LIMIT_MB || '0', 10) <= 512;
+  (process.env.MEMORY_LIMIT_MB ? parseInt(process.env.MEMORY_LIMIT_MB, 10) <= 512 : false);
 const MAX_LEADS_QUICK = parseInt(process.env.MAX_LEADS_QUICK || (LOW_MEMORY_MODE ? '20' : '200'));
 const MAX_LEADS_DEEP = parseInt(process.env.MAX_LEADS_DEEP || (LOW_MEMORY_MODE ? '30' : '1000'));
 const DAILY_LEAD_LIMIT = parseInt(process.env.DAILY_LEAD_LIMIT || (LOW_MEMORY_MODE ? '200' : '2000'));
 const DEEP_DEFAULT_GRID_SIZE = parseInt(process.env.DEEP_GRID_SIZE || (LOW_MEMORY_MODE ? '1' : '2'));
 const DEEP_MAX_CELLS_PER_TERM = parseInt(process.env.DEEP_MAX_CELLS_PER_TERM || (LOW_MEMORY_MODE ? '1' : '4'));
 const DEEP_MAX_CONCURRENCY = parseInt(process.env.DEEP_MAX_CONCURRENCY || '1');
-const ENABLE_DETAIL_EXTRACTION = !LOW_MEMORY_MODE && process.env.ENABLE_DETAIL_EXTRACTION !== 'false';
+const ENABLE_DETAIL_EXTRACTION =
+  process.env.ENABLE_DETAIL_EXTRACTION === 'true' ||
+  process.env.ENABLE_DETAIL_EXTRACTION === '1' ||
+  process.env.ENABLE_DETAIL_EXTRACTION === undefined;
 const LOW_MEMORY_ARGS = LOW_MEMORY_MODE
   ? [
       '--single-process',
@@ -506,4 +509,5 @@ app.get('/api/scrape/active', async (req, res) => { const [rows] = await pool.qu
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
+console.log('ENABLE_DETAIL_EXTRACTION =', ENABLE_DETAIL_EXTRACTION);
 app.listen(PORT, () => console.log(`Scraper API running on port ${PORT}`));
