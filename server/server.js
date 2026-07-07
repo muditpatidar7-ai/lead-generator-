@@ -11,6 +11,7 @@ const cors = require("cors");
 const mysql = require("mysql2/promise");
 const puppeteer = require("puppeteer-core");
 const chromium = require("@sparticuz/chromium").default;
+const child_process = require('child_process');
 const { v4: uuidv4 } = require("uuid");
 
 const app = express();
@@ -337,13 +338,64 @@ async function launchBrowser() {
     console.log("Low memory mode enabled: lighter browser limits and reduced scrape caps are active.");
   }
 
-  const executablePath = await chromium.executablePath();
-  console.log("Launching browser with executable:", executablePath);
+  let executablePath = await chromium.executablePath();
+  console.log("Launching browser with executable (initial):", executablePath);
 
-  try {
-    await fs.promises.chmod(executablePath, 0o755);
-  } catch (err) {
-    console.warn("Unable to chmod Chromium binary, continuing anyway:", err.message);
+  async function makeExecutable(p) {
+    try {
+      await fs.promises.chmod(p, 0o755);
+    } catch (err) {
+      // ignore, we'll surface better error below if execution still fails
+      console.warn("chmod failed for", p, err.message);
+    }
+  }
+
+  // Ensure file is executable; if not, try chmod and then test by running --version.
+  await makeExecutable(executablePath);
+
+  function testExec(p) {
+    try {
+      const out = child_process.spawnSync(p, ["--version"], { timeout: 5000 });
+      if (out.error) throw out.error;
+      if (out.status !== 0 && out.status !== null) {
+        throw new Error(`non-zero exit (${out.status})`);
+      }
+      return true;
+    } catch (err) {
+      return err;
+    }
+  }
+
+  let testResult = testExec(executablePath);
+  if (testResult !== true) {
+    console.warn('Chromium exec test failed on initial path:', testResult && testResult.message ? testResult.message : testResult);
+
+    // Fallback attempt: copy the binary into project folder where exec is usually allowed
+    try {
+      const fallbackDir = path.join(process.cwd(), '.chromium');
+      if (!fs.existsSync(fallbackDir)) await fs.promises.mkdir(fallbackDir, { recursive: true });
+      const fallbackPath = path.join(fallbackDir, path.basename(executablePath));
+      try {
+        await fs.promises.copyFile(executablePath, fallbackPath);
+        await makeExecutable(fallbackPath);
+        console.log('Copied chromium binary to fallback path:', fallbackPath);
+        const fallbackTest = testExec(fallbackPath);
+        if (fallbackTest === true) executablePath = fallbackPath;
+        else console.warn('Fallback binary test failed:', fallbackTest && fallbackTest.message ? fallbackTest.message : fallbackTest);
+      } catch (copyErr) {
+        console.warn('Failed to copy chromium to fallback path:', copyErr.message);
+      }
+    } catch (err) {
+      console.warn('Fallback preparation failed:', err.message);
+    }
+  }
+
+  // Final validation before launch
+  testResult = testExec(executablePath);
+  if (testResult !== true) {
+    const errMsg = `Chromium executable not runnable at ${executablePath} — last error: ${testResult && testResult.message ? testResult.message : JSON.stringify(testResult)}`;
+    console.error(errMsg);
+    throw new Error(errMsg + " — check filesystem permissions or mount options (noexec). See https://pptr.dev/troubleshooting");
   }
 
   return puppeteer.launch({
