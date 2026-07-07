@@ -340,6 +340,12 @@ async function launchBrowser() {
   const executablePath = await chromium.executablePath();
   console.log("Launching browser with executable:", executablePath);
 
+  try {
+    await fs.promises.chmod(executablePath, 0o755);
+  } catch (err) {
+    console.warn("Unable to chmod Chromium binary, continuing anyway:", err.message);
+  }
+
   return puppeteer.launch({
     headless: true,
     executablePath,
