@@ -1,6 +1,6 @@
 // ============================================
 // Scraper API - Express + puppeteer-core + @sparticuz/chromium
-// Restored clean version with extraction lock and improved detail extraction
+// FIXED VERSION - see FIXES.md style comments marked with "// FIX:"
 // ============================================
 require('dotenv').config();
 const fs = require('fs');
@@ -25,17 +25,14 @@ app.use((req, res, next) => {
 const LOW_MEMORY_MODE =
   process.env.LOW_MEMORY_MODE === 'true' ||
   process.env.LOW_MEMORY_MODE === '1' ||
-  (process.env.MEMORY_LIMIT_MB ? parseInt(process.env.MEMORY_LIMIT_MB, 10) <= 512 : false);
+  parseInt(process.env.MEMORY_LIMIT_MB || '0', 10) <= 512;
 const MAX_LEADS_QUICK = parseInt(process.env.MAX_LEADS_QUICK || (LOW_MEMORY_MODE ? '20' : '200'));
 const MAX_LEADS_DEEP = parseInt(process.env.MAX_LEADS_DEEP || (LOW_MEMORY_MODE ? '30' : '1000'));
 const DAILY_LEAD_LIMIT = parseInt(process.env.DAILY_LEAD_LIMIT || (LOW_MEMORY_MODE ? '200' : '2000'));
 const DEEP_DEFAULT_GRID_SIZE = parseInt(process.env.DEEP_GRID_SIZE || (LOW_MEMORY_MODE ? '1' : '2'));
 const DEEP_MAX_CELLS_PER_TERM = parseInt(process.env.DEEP_MAX_CELLS_PER_TERM || (LOW_MEMORY_MODE ? '1' : '4'));
 const DEEP_MAX_CONCURRENCY = parseInt(process.env.DEEP_MAX_CONCURRENCY || '1');
-const ENABLE_DETAIL_EXTRACTION =
-  process.env.ENABLE_DETAIL_EXTRACTION === 'true' ||
-  process.env.ENABLE_DETAIL_EXTRACTION === '1' ||
-  process.env.ENABLE_DETAIL_EXTRACTION === undefined;
+const ENABLE_DETAIL_EXTRACTION = !LOW_MEMORY_MODE && process.env.ENABLE_DETAIL_EXTRACTION !== 'false';
 const LOW_MEMORY_ARGS = LOW_MEMORY_MODE
   ? [
       '--single-process',
@@ -332,9 +329,16 @@ async function scrapeViewport(browser, url, maxResults, onProgress, jobId, onLea
   return leads;
 }
 
+// FIX: `page` is now declared OUTSIDE the try block (with `let`, initialized to null)
+// so it is actually reachable inside `catch`. In the original code, `const page`
+// was declared inside `try {}`, which made it block-scoped and therefore
+// `undefined`/unreachable in `catch {}` -> pages were silently leaking (never
+// closed) whenever enrichLead threw, e.g. on a timeout. Under LOW_MEMORY_MODE
+// this leak is exactly what causes OOM crashes over a long-running deep scrape.
 async function enrichLead(browser, lead, jobId) {
+  let page = null;
   try {
-    const page = await browser.newPage();
+    page = await browser.newPage();
     await page.setRequestInterception(true);
     page.on('request', (req) => { if (['image','stylesheet','font','media'].includes(req.resourceType())) req.abort(); else req.continue(); });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
@@ -352,34 +356,51 @@ async function enrichLead(browser, lead, jobId) {
       }
     }
     await runWithCancellation(jobId, () => page.waitForSelector('button[data-tooltip*="phone"], button[aria-label*="Phone"], button[data-item-id^="phone"], a[href^="tel:"], a[data-item-id="authority"]', { timeout: 10000 }).catch(() => {}));
-    await runWithCancellation(jobId, () => page.waitForTimeout(1200));
+    await runWithCancellation(jobId, () => new Promise((r) => setTimeout(r, 1200)));
 
     const data = await runWithCancellation(jobId, () => page.evaluate(() => {
       const phoneRegex = /(\+?\d[\d\-()\s]{6,}\d)/g;
       const cleanPhone = (value) => value.replace(/[^+\d]/g, '');
+      // FIX: digit-count sanity check so things like "4.8 stars 1,203 reviews"
+      // or a stray date/zip can't masquerade as a phone number.
+      const isPlausiblePhone = (digits) => digits.replace(/^\+/, '').length >= 7 && digits.replace(/^\+/, '').length <= 15;
       const result = { phoneCandidates: [], websiteCandidates: [], instagramCandidates: [] };
 
-      const addPhone = (value) => {
+      const addPhone = (value, trusted) => {
         if (!value) return;
         const match = value.match(phoneRegex);
         if (!match) return;
-        match.forEach((m) => result.phoneCandidates.push(cleanPhone(m)));
+        match.forEach((m) => {
+          const cleaned = cleanPhone(m);
+          if (isPlausiblePhone(cleaned)) {
+            // FIX: trusted candidates (tel: links, dedicated phone buttons/aria-labels)
+            // go to the front of the list so they win over noisy text-node matches.
+            if (trusted) result.phoneCandidates.unshift(cleaned);
+            else result.phoneCandidates.push(cleaned);
+          }
+        });
       };
 
+      // FIX: removed the stray leading "+" that was accidentally left in front of
+      // this line (looked like a copy-pasted diff hunk marker, not valid intent).
       const phoneControls = Array.from(document.querySelectorAll('a[href^="tel:"], button[aria-label*="Phone"], button[data-tooltip*="phone"], div[aria-label*="Phone"], span[aria-label*="Phone"], button[data-item-id^="phone"]'));
       for (const el of phoneControls) {
         try {
-          if (el.href && el.href.startsWith('tel:')) addPhone(el.href.replace(/^tel:/, ''));
-          addPhone(el.getAttribute('aria-label'));
-          addPhone(el.getAttribute('data-tooltip'));
-+          addPhone(el.textContent);
+          if (el.href && el.href.startsWith('tel:')) addPhone(el.href.replace(/^tel:/, ''), true);
+          addPhone(el.getAttribute('aria-label'), true);
+          addPhone(el.getAttribute('data-tooltip'), true);
+          addPhone(el.textContent, true);
         } catch (e) {}
       }
 
-      const textNodes = Array.from(document.querySelectorAll('div, span, p, li'));
-      for (const node of textNodes) {
-        const text = (node.textContent || '').trim();
-        if (text.length > 10 && text.length < 80) addPhone(text);
+      // FIX: only fall back to the broad, noisy page-wide text scan if the
+      // trusted, dedicated phone controls above found nothing at all.
+      if (result.phoneCandidates.length === 0) {
+        const textNodes = Array.from(document.querySelectorAll('div, span, p, li'));
+        for (const node of textNodes) {
+          const text = (node.textContent || '').trim();
+          if (text.length > 10 && text.length < 80) addPhone(text, false);
+        }
       }
 
       const anchors = Array.from(document.querySelectorAll('a[href^="http"]'));
@@ -418,7 +439,10 @@ async function enrichLead(browser, lead, jobId) {
     }
     await page.close().catch(()=>{});
   } catch (e) {
-    try { if (page) await page.close().catch(()=>{}); } catch {}
+    // FIX: `page` is now reachable here because it was declared with `let` above
+    // the try block, so this cleanup actually runs instead of throwing a hidden
+    // ReferenceError.
+    if (page) { try { await page.close().catch(() => {}); } catch {} }
   }
 }
 
@@ -509,5 +533,4 @@ app.get('/api/scrape/active', async (req, res) => { const [rows] = await pool.qu
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
-console.log('ENABLE_DETAIL_EXTRACTION =', ENABLE_DETAIL_EXTRACTION);
 app.listen(PORT, () => console.log(`Scraper API running on port ${PORT}`));
