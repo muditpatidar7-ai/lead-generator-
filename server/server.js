@@ -1,6 +1,8 @@
 // ============================================
 // Scraper API - Express + puppeteer-core + @sparticuz/chromium
 // Restored clean version with extraction lock and improved detail extraction
+// FIXED: LOW_MEMORY_MODE default bug (was disabling detail extraction),
+//        page-scope crash in enrichLead catch block, and stale detail selectors
 // ============================================
 require('dotenv').config();
 const fs = require('fs');
@@ -22,17 +24,32 @@ app.use((req, res, next) => {
 });
 
 // Limits / flags
+// FIX: previously `parseInt(process.env.MEMORY_LIMIT_MB || '0', 10) <= 512`
+// meant that when MEMORY_LIMIT_MB was NOT set, it defaulted to '0', and
+// 0 <= 512 is always true -> LOW_MEMORY_MODE was ALWAYS true by default,
+// which silently disabled ENABLE_DETAIL_EXTRACTION below. Now MEMORY_LIMIT_MB
+// only counts if it was actually provided.
 const LOW_MEMORY_MODE =
   process.env.LOW_MEMORY_MODE === 'true' ||
   process.env.LOW_MEMORY_MODE === '1' ||
-  parseInt(process.env.MEMORY_LIMIT_MB || '0', 10) <= 512;
+  (process.env.MEMORY_LIMIT_MB !== undefined && parseInt(process.env.MEMORY_LIMIT_MB, 10) <= 512);
+
 const MAX_LEADS_QUICK = parseInt(process.env.MAX_LEADS_QUICK || (LOW_MEMORY_MODE ? '20' : '200'));
 const MAX_LEADS_DEEP = parseInt(process.env.MAX_LEADS_DEEP || (LOW_MEMORY_MODE ? '30' : '1000'));
 const DAILY_LEAD_LIMIT = parseInt(process.env.DAILY_LEAD_LIMIT || (LOW_MEMORY_MODE ? '200' : '2000'));
 const DEEP_DEFAULT_GRID_SIZE = parseInt(process.env.DEEP_GRID_SIZE || (LOW_MEMORY_MODE ? '1' : '2'));
 const DEEP_MAX_CELLS_PER_TERM = parseInt(process.env.DEEP_MAX_CELLS_PER_TERM || (LOW_MEMORY_MODE ? '1' : '4'));
 const DEEP_MAX_CONCURRENCY = parseInt(process.env.DEEP_MAX_CONCURRENCY || '1');
-const ENABLE_DETAIL_EXTRACTION = !LOW_MEMORY_MODE && process.env.ENABLE_DETAIL_EXTRACTION !== 'false';
+
+// FIX: you can now force this on explicitly regardless of LOW_MEMORY_MODE
+// by setting ENABLE_DETAIL_EXTRACTION=true in env.
+const ENABLE_DETAIL_EXTRACTION =
+  process.env.ENABLE_DETAIL_EXTRACTION === 'true'
+    ? true
+    : process.env.ENABLE_DETAIL_EXTRACTION === 'false'
+    ? false
+    : !LOW_MEMORY_MODE;
+
 const LOW_MEMORY_ARGS = LOW_MEMORY_MODE
   ? [
       '--single-process',
@@ -44,6 +61,8 @@ const LOW_MEMORY_ARGS = LOW_MEMORY_MODE
       '--memory-pressure-off',
     ]
   : [];
+
+console.log(`[config] LOW_MEMORY_MODE=${LOW_MEMORY_MODE} ENABLE_DETAIL_EXTRACTION=${ENABLE_DETAIL_EXTRACTION}`);
 
 // DB pool
 const pool = mysql.createPool({
@@ -329,37 +348,85 @@ async function scrapeViewport(browser, url, maxResults, onProgress, jobId, onLea
   return leads;
 }
 
+// FIX: `page` declared with `let` outside try so the catch block can safely
+// reference and close it (previously threw ReferenceError on any failure,
+// which silently ate every enrichLead error and leaked pages).
+// FIX: wait selector list updated to current Google Maps DOM attributes,
+// with a longer settle time and a fallback wait, and phone extraction now
+// prefers the actual phone button (data-item-id="phone:tel:...") instead
+// of a generic regex scan across the whole page (which was picking up
+// review counts / ratings / random digits as "phone numbers").
 async function enrichLead(browser, lead, jobId) {
+  let page;
   try {
-    const page = await browser.newPage();
+    page = await browser.newPage();
     await page.setRequestInterception(true);
     page.on('request', (req) => { if (['image','stylesheet','font','media'].includes(req.resourceType())) req.abort(); else req.continue(); });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
     const targetUrl = lead.placeUrl || `https://www.google.com/maps/search/${encodeURIComponent(lead.name + ' ' + (lead.locationSuffix || ''))}`;
-    await runWithCancellation(jobId, () => page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }));
-    await runWithCancellation(jobId, () => new Promise(r => setTimeout(r, 1500)));
+    await runWithCancellation(jobId, () => page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }));
+
     if (!page.url().includes('/maps/place/')) {
       const first = await page.$('[role="feed"] > div:first-child a[href*="/maps/place/"]');
-      if (first) { await runWithCancellation(jobId, () => first.click()); await runWithCancellation(jobId, () => new Promise(r => setTimeout(r, 2000))); }
+      if (first) { await runWithCancellation(jobId, () => first.click()); }
     }
-    await runWithCancellation(jobId, () => page.waitForSelector('button[data-tooltip="Copy phone number"], button[data-item-id^="phone"], a[data-item-id="authority"]', { timeout: 6000 }).catch(()=>{}));
+
+    // Wait for the place detail panel to actually load, using selectors
+    // that match current Google Maps markup, with a generous timeout and
+    // a settle pause afterward so lazy-rendered buttons appear.
+    await runWithCancellation(jobId, () =>
+      page.waitForSelector(
+        [
+          'button[data-item-id^="phone:tel:"]',
+          'a[data-item-id="authority"]',
+          'button[aria-label^="Phone:"]',
+          'button[data-tooltip="Copy phone number"]',
+        ].join(', '),
+        { timeout: 10000 }
+      ).catch(() => {})
+    );
+    await runWithCancellation(jobId, () => new Promise(r => setTimeout(r, 1200)));
 
     const data = await runWithCancellation(jobId, () => page.evaluate(() => {
-      const phoneRegex = /(\+?\d[\d\-()\s]{6,}\d)/g;
-      const result = { phoneCandidates: [], websiteCandidates: [], instagramCandidates: [] };
+      const result = { phone: null, phoneCandidates: [], websiteCandidates: [], instagramCandidates: [] };
 
-      // collect phone candidates from known controls and visible text
-      const controls = Array.from(document.querySelectorAll('button, a, div, span'));
-      for (const el of controls) {
-        try {
-          if (el.href && el.href.startsWith('tel:')) result.phoneCandidates.push(el.href.replace(/^tel:/, '').replace(/[^+\d]/g, ''));
-        } catch (e) {}
-        const text = (el.getAttribute && (el.getAttribute('aria-label') || el.getAttribute('data-tooltip'))) || el.textContent || '';
-        const m = text.match(phoneRegex);
-        if (m) for (const mm of m) result.phoneCandidates.push(mm.replace(/[^+\d]/g, ''));
+      // 1. Prefer the dedicated phone button Google Maps renders on the
+      // detail panel — this is the reliable source of truth.
+      const phoneBtn = document.querySelector('button[data-item-id^="phone:tel:"]');
+      if (phoneBtn) {
+        const raw = phoneBtn.getAttribute('data-item-id') || '';
+        const m = raw.match(/phone:tel:(.+)/);
+        if (m) result.phone = m[1].replace(/[^+\d]/g, '');
+        if (!result.phone) {
+          const label = phoneBtn.getAttribute('aria-label') || phoneBtn.textContent || '';
+          const lm = label.match(/(\+?\d[\d\-()\s]{6,}\d)/);
+          if (lm) result.phone = lm[1].replace(/[^+\d]/g, '');
+        }
       }
 
-      // collect website anchors
+      // 2. Fallback: tel: links anywhere on the page.
+      if (!result.phone) {
+        const telAnchor = document.querySelector('a[href^="tel:"]');
+        if (telAnchor) result.phone = telAnchor.href.replace(/^tel:/, '').replace(/[^+\d]/g, '');
+      }
+
+      // 3. Last-resort fallback: scan aria-labels that explicitly say "Phone:"
+      if (!result.phone) {
+        const candidates = Array.from(document.querySelectorAll('button[aria-label], div[aria-label]'));
+        for (const el of candidates) {
+          const label = el.getAttribute('aria-label') || '';
+          if (/^phone:/i.test(label.trim())) {
+            const m = label.match(/(\+?\d[\d\-()\s]{6,}\d)/);
+            if (m) { result.phone = m[1].replace(/[^+\d]/g, ''); break; }
+          }
+        }
+      }
+
+      // Website: the "authority" data-item-id is Maps' own website link.
+      const websiteAnchor = document.querySelector('a[data-item-id="authority"]');
+      if (websiteAnchor && websiteAnchor.href) result.websiteCandidates.push(websiteAnchor.href);
+
+      // Broader anchor scan as fallback / to catch Instagram links.
       const anchors = Array.from(document.querySelectorAll('a[href^="http"]'));
       for (const a of anchors) {
         const href = a.href;
@@ -368,32 +435,28 @@ async function enrichLead(browser, lead, jobId) {
         if (/instagram\.com/i.test(href)) result.instagramCandidates.push(href);
       }
 
-      // also look for meta tags/link rel that hint at website
       const linkRel = document.querySelector('link[rel="canonical"]')?.href || document.querySelector('meta[property="og:url"]')?.content || null;
       if (linkRel && !/google\./i.test(linkRel)) result.websiteCandidates.unshift(linkRel);
 
       return result;
     }));
 
-    // pick best phone candidate
-    if (data.phoneCandidates && data.phoneCandidates.length) {
-      lead.phone = data.phoneCandidates[0];
-    }
+    if (data.phone) lead.phone = data.phone;
 
-    // pick website or instagram
     if (data.instagramCandidates && data.instagramCandidates.length) {
       lead.instagram = data.instagramCandidates[0];
     } else if (data.websiteCandidates && data.websiteCandidates.length) {
       lead.website = data.websiteCandidates[0];
     }
 
-    if (!lead.phone && (!lead.website && !lead.instagram)) {
+    if (!lead.phone && !lead.website && !lead.instagram) {
       console.log(`enrichLead: no phone/website/instagram for job=${jobId} name=${lead.name} url=${page.url()}`);
-      console.log('candidates:', { phones: data.phoneCandidates && data.phoneCandidates.slice(0,5), websites: data.websiteCandidates && data.websiteCandidates.slice(0,5), instas: data.instagramCandidates && data.instagramCandidates.slice(0,5) });
+      console.log('candidates:', { websites: data.websiteCandidates && data.websiteCandidates.slice(0,5), instas: data.instagramCandidates && data.instagramCandidates.slice(0,5) });
     }
     await page.close().catch(()=>{});
   } catch (e) {
-    try { if (page) await page.close().catch(()=>{}); } catch {}
+    console.log(`enrichLead error for ${lead && lead.name}:`, e && e.message ? e.message : e);
+    if (page) await page.close().catch(()=>{});
   }
 }
 
