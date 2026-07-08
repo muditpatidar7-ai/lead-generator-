@@ -12,6 +12,7 @@ const puppeteer = require('puppeteer-core');
 const chromium = require('@sparticuz/chromium').default;
 const child_process = require('child_process');
 const { v4: uuidv4 } = require('uuid');
+const { pickBestPhoneCandidate } = require('./phone-utils');
 
 const app = express();
 app.use(cors());
@@ -299,19 +300,47 @@ async function dismissConsentIfPresent(page) {
 }
 
 function extractCardData() {
-  const items = document.querySelectorAll('[role="feed"] > div');
+  const cardSelectors = [
+    '[role="feed"] > div',
+    '[role="feed"] > [role="article"]',
+    '[role="list"] > div',
+    '[role="list"] > [role="article"]',
+    '[role="listitem"]',
+    '[data-result-index]',
+    '[data-index]'
+  ];
+
+  const items = Array.from(document.querySelectorAll(cardSelectors.join(','))).filter((item) => {
+    const text = (item.textContent || '').replace(/\s+/g, ' ').trim();
+    if (!text || text.length < 6) return false;
+    return Boolean(item.querySelector('a[href*="/maps/place/"], a[href*="/maps/search/"], a[href*="/maps/"]'));
+  });
+
   return Array.from(items).map((item) => {
-    const linkEl = item.querySelector('a[href*="/maps/place/"]');
-    const name = linkEl?.getAttribute('aria-label')?.trim() || item.querySelector('.qBF1Pd')?.textContent?.trim();
+    const linkEl = item.querySelector('a[href*="/maps/place/"], a[href*="/maps/search/"], a[href*="/maps/"]') || item.querySelector('a');
+    const name = [
+      linkEl?.getAttribute('aria-label'),
+      linkEl?.getAttribute('title'),
+      linkEl?.getAttribute('data-tooltip'),
+      item.querySelector('h3, h2, [role="heading"], .qBF1Pd, .fontHeadlineSmall')?.textContent,
+      linkEl?.textContent,
+    ].map((value) => (value || '').toString().trim()).find(Boolean) || null;
+
     if (!name) return null;
-    const ratingAria = item.querySelector('span[role="img"][aria-label*="star"]')?.getAttribute('aria-label');
+
+    const ratingAria = item.querySelector('span[role="img"][aria-label*="star"], [role="img"][aria-label*="star"]')?.getAttribute('aria-label');
     const ratingMatch = ratingAria?.match(/([\d.]+)\s*star/i);
     const rating = ratingMatch ? parseFloat(ratingMatch[1]) : null;
     const reviewsMatch = ratingAria?.match(/([\d,]+)\s*review/i);
-    const reviews = reviewsMatch ? parseInt(reviewsMatch[1].replace(/,/g, '')) : null;
-    const spans = item.querySelectorAll('.W4Efsd span');
-    const category = spans[0]?.textContent?.trim() || null;
-    const address = spans[spans.length - 1]?.textContent?.trim() || null;
+    const reviews = reviewsMatch ? parseInt(reviewsMatch[1].replace(/,/g, ''), 10) : null;
+
+    const textSegments = Array.from(item.querySelectorAll('div, span, p, h3, h2'))
+      .map((el) => (el.textContent || '').trim())
+      .filter((text) => text && text.length > 2 && text.length < 90 && !/^\d+(\.\d+)?$/.test(text) && !/(star|review|reviews|open|closed|hours|call|website|share|save)/i.test(text))
+      .filter((text, index, arr) => arr.indexOf(text) === index);
+
+    const category = textSegments.find((text) => !/^\+?\d[\d\-\s().]{6,}\d$/.test(text) && !/^(street|road|rd|st|ave|avenue|lane|dr|court|place|town|city|india)$/i.test(text)) || null;
+    const address = textSegments.find((text) => /street|road|rd|st|avenue|ave|lane|dr|court|place|town|city|india|no\.|#|,/.test(text)) || textSegments[textSegments.length - 1] || null;
     const placeUrl = linkEl?.href || null;
     return { name, rating, reviews, category, address, placeUrl };
   }).filter(Boolean);
@@ -335,8 +364,12 @@ async function scrapeViewport(browser, url, maxResults, onProgress, jobId, onLea
   }
   if (/\/sorry\//i.test(page.url())) throw new Error('Google blocked / CAPTCHA');
   await dismissConsentIfPresent(page);
-  const feedOk = await runWithCancellation(jobId, () => page.waitForSelector('[role="feed"]', { timeout: 15000 }).then(()=>true).catch(()=>false));
-  if (!feedOk) { await dismissConsentIfPresent(page); await runWithCancellation(jobId, () => page.reload({ waitUntil: 'networkidle2', timeout: 40000 }).catch(()=>{})); await runWithCancellation(jobId, () => page.waitForSelector('[role="feed"]', { timeout: 15000 }).catch(()=>{})); }
+  const feedOk = await runWithCancellation(jobId, () => page.waitForSelector('[role="feed"], [role="list"], [data-result-index], [data-index]', { timeout: 20000 }).then(()=>true).catch(()=>false));
+  if (!feedOk) {
+    await dismissConsentIfPresent(page);
+    await runWithCancellation(jobId, () => page.reload({ waitUntil: 'domcontentloaded', timeout: 40000 }).catch(()=>{}));
+    await runWithCancellation(jobId, () => page.waitForSelector('[role="feed"], [role="list"], [data-result-index], [data-index]', { timeout: 20000 }).catch(()=>{}));
+  }
 
   const leads = [];
   const seenKeys = new Set();
@@ -389,15 +422,31 @@ async function enrichLead(browser, lead, jobId) {
         await runWithCancellation(jobId, () => new Promise((r) => setTimeout(r, 2500)));
       }
     }
-    await runWithCancellation(jobId, () => page.waitForSelector('button[data-tooltip*="phone"], button[aria-label*="Phone"], button[data-item-id^="phone"], a[href^="tel:"], a[data-item-id="authority"]', { timeout: 10000 }).catch(() => {}));
-    await runWithCancellation(jobId, () => new Promise((r) => setTimeout(r, 1200)));
+    await runWithCancellation(jobId, () => page.waitForSelector('a[href^="tel:"], button[aria-label*="phone"], button[aria-label*="call"], button[data-tooltip*="phone"], button[data-tooltip*="call"], [role="button"][aria-label*="phone"], [role="button"][aria-label*="call"]', { timeout: 8000 }).catch(() => {}));
+    await runWithCancellation(jobId, async () => {
+      await page.evaluate(() => {
+        const targets = Array.from(document.querySelectorAll('button, [role="button"], a, div'));
+        const target = targets.find((el) => {
+          const label = `${el.getAttribute('aria-label') || ''} ${el.getAttribute('title') || ''} ${el.getAttribute('data-tooltip') || ''} ${el.textContent || ''}`.toLowerCase();
+          return /phone|call|contact|tel/i.test(label);
+        });
+        if (target && typeof target.click === 'function') {
+          try { target.click(); } catch {}
+        }
+      });
+      await new Promise((r) => setTimeout(r, 1800));
+    });
 
     const data = await runWithCancellation(jobId, () => page.evaluate(() => {
       const phoneRegex = /(\+?\d[\d\-()\s]{6,}\d)/g;
-      const cleanPhone = (value) => value.replace(/[^+\d]/g, '');
-      // FIX: digit-count sanity check so things like "4.8 stars 1,203 reviews"
-      // or a stray date/zip can't masquerade as a phone number.
-      const isPlausiblePhone = (digits) => digits.replace(/^\+/, '').length >= 7 && digits.replace(/^\+/, '').length <= 15;
+      const cleanPhone = (value) => {
+        if (!value) return null;
+        const cleaned = String(value).replace(/[^\d+]/g, '');
+        const digitsOnly = cleaned.replace(/\+/g, '');
+        if (digitsOnly.length < 7 || digitsOnly.length > 15) return null;
+        return cleaned.startsWith('+') ? '+' + digitsOnly : digitsOnly;
+      };
+      const isPlausiblePhone = (digits) => digits && digits.replace(/^\+/, '').length >= 7 && digits.replace(/^\+/, '').length <= 15;
       const result = { phoneCandidates: [], websiteCandidates: [], instagramCandidates: [] };
 
       const addPhone = (value, trusted) => {
@@ -407,32 +456,41 @@ async function enrichLead(browser, lead, jobId) {
         match.forEach((m) => {
           const cleaned = cleanPhone(m);
           if (isPlausiblePhone(cleaned)) {
-            // FIX: trusted candidates (tel: links, dedicated phone buttons/aria-labels)
-            // go to the front of the list so they win over noisy text-node matches.
             if (trusted) result.phoneCandidates.unshift(cleaned);
             else result.phoneCandidates.push(cleaned);
           }
         });
       };
 
-      const phoneControls = Array.from(document.querySelectorAll('a[href^="tel:"], button[aria-label*="Phone"], button[data-tooltip*="phone"], div[aria-label*="Phone"], span[aria-label*="Phone"], button[data-item-id^="phone"]'));
+      const phoneControls = Array.from(document.querySelectorAll('a[href^="tel:"], button, [role="button"], a, span, div, p, li'));
       for (const el of phoneControls) {
         try {
           if (el.href && el.href.startsWith('tel:')) addPhone(el.href.replace(/^tel:/, ''), true);
           addPhone(el.getAttribute('aria-label'), true);
+          addPhone(el.getAttribute('title'), true);
           addPhone(el.getAttribute('data-tooltip'), true);
+          addPhone(el.getAttribute('data-phone'), true);
           addPhone(el.textContent, true);
         } catch (e) {}
       }
 
-      // FIX: only fall back to the broad, noisy page-wide text scan if the
-      // trusted, dedicated phone controls above found nothing at all.
       if (result.phoneCandidates.length === 0) {
         const textNodes = Array.from(document.querySelectorAll('div, span, p, li'));
         for (const node of textNodes) {
           const text = (node.textContent || '').trim();
           if (text.length > 10 && text.length < 80) addPhone(text, false);
         }
+      }
+
+      const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+      for (const script of scripts) {
+        try {
+          const parsed = JSON.parse(script.textContent || '{}');
+          const telephone = Array.isArray(parsed.telephone)
+            ? parsed.telephone.find(Boolean)
+            : parsed.telephone;
+          if (telephone) addPhone(String(telephone), true);
+        } catch (e) {}
       }
 
       const anchors = Array.from(document.querySelectorAll('a[href^="http"]'));
@@ -451,8 +509,9 @@ async function enrichLead(browser, lead, jobId) {
       return result;
     }));
 
-    if (data.phoneCandidates && data.phoneCandidates.length) {
-      lead.phone = data.phoneCandidates[0];
+    const preferredPhone = pickBestPhoneCandidate(data.phoneCandidates || []);
+    if (preferredPhone) {
+      lead.phone = preferredPhone;
     }
 
     if (data.instagramCandidates && data.instagramCandidates.length) {
