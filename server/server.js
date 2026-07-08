@@ -265,6 +265,7 @@ async function launchBrowser() {
       '--mute-audio',
       '--lang=en-US,en',
       '--disable-features=TranslateUI,BlinkGenPropertyTrees',
+      '--disable-blink-features=AutomationControlled',
       ...LOW_MEMORY_ARGS,
     ],
   });
@@ -297,6 +298,65 @@ async function dismissConsentIfPresent(page) {
     if (clicked) await new Promise((r) => setTimeout(r, 1000));
     return clicked;
   } catch { return false; }
+}
+
+async function preparePage(page) {
+  await page.setRequestInterception(true);
+  page.on('request', (req) => { if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) req.abort(); else req.continue(); });
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36');
+  await page.setViewport({ width: 1280, height: 720 });
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-User': '?1',
+    'Sec-Fetch-Dest': 'document',
+    'Upgrade-Insecure-Requests': '1',
+  });
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(window, 'chrome', { get: () => ({ runtime: {}, loadTimes: () => {}, csi: () => {}, app: {} }) });
+  });
+}
+
+async function detectCaptcha(page) {
+  try {
+    const url = page.url() || '';
+    if (/\/sorry\//i.test(url)) return true;
+    const text = await page.evaluate(() => {
+      const bodyText = document.body ? document.body.innerText : '';
+      return (bodyText || '').slice(0, 4000).toLowerCase();
+    });
+    return /(verify you are human|captcha|sorry|we detected unusual traffic|robot|automated|request blocked)/i.test(text);
+  } catch {
+    return false;
+  }
+}
+
+async function navigateWithRetry(page, url, jobId, options = {}) {
+  const timeout = options.timeout || 60000;
+  const maxAttempts = options.maxAttempts || 3;
+  const waitUntil = options.waitUntil || 'domcontentloaded';
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await runWithCancellation(jobId, () => page.goto(url, { waitUntil, timeout }));
+      await runWithCancellation(jobId, () => new Promise((r) => setTimeout(r, attempt === 1 ? 1200 : 2500)));
+      if (!(await detectCaptcha(page))) return;
+      lastError = new Error('Google blocked / CAPTCHA');
+    } catch (err) {
+      if (err && err.message === 'CANCELLED_BY_USER') throw err;
+      lastError = err || new Error('Google blocked / CAPTCHA');
+    }
+    if (attempt < maxAttempts) {
+      await runWithCancellation(jobId, () => new Promise((r) => setTimeout(r, 4000 * attempt)));
+      try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 40000 }).catch(() => {}); } catch {}
+    }
+  }
+  throw lastError || new Error('Google blocked / CAPTCHA');
 }
 
 function extractCardData() {
@@ -348,10 +408,7 @@ function extractCardData() {
 
 async function scrapeViewport(browser, url, maxResults, onProgress, jobId, onLeadDiscovered) {
   const page = await browser.newPage();
-  await page.setRequestInterception(true);
-  page.on('request', (req) => { if (['image','stylesheet','font','media'].includes(req.resourceType())) req.abort(); else req.continue(); });
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36');
-  await page.setViewport({ width: 1280, height: 720 });
+  await preparePage(page);
 
   // FIX2: surface page-level crashes (renderer OOM/crash for THIS tab specifically)
   // instead of letting them bubble up as an opaque Target-closed error later.
@@ -360,9 +417,15 @@ async function scrapeViewport(browser, url, maxResults, onProgress, jobId, onLea
 
   let navigated = false;
   for (let attempt = 1; attempt <= 2 && !navigated; attempt++) {
-    try { await runWithCancellation(jobId, () => page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 })); navigated = true; } catch (err) { if (err.message === 'CANCELLED_BY_USER') throw err; if (attempt === 2) throw err; await runWithCancellation(jobId, () => new Promise(r => setTimeout(r, 3000))); }
+    try {
+      await navigateWithRetry(page, url, jobId, { timeout: 60000, maxAttempts: 2 });
+      navigated = true;
+    } catch (err) {
+      if (err && err.message === 'CANCELLED_BY_USER') throw err;
+      if (attempt === 2) throw err;
+      await runWithCancellation(jobId, () => new Promise((r) => setTimeout(r, 3000)));
+    }
   }
-  if (/\/sorry\//i.test(page.url())) throw new Error('Google blocked / CAPTCHA');
   await dismissConsentIfPresent(page);
   const feedOk = await runWithCancellation(jobId, () => page.waitForSelector('[role="feed"], [role="list"], [data-result-index], [data-index]', { timeout: 20000 }).then(()=>true).catch(()=>false));
   if (!feedOk) {
@@ -406,12 +469,10 @@ async function enrichLead(browser, lead, jobId) {
   let page = null;
   try {
     page = await browser.newPage();
-    await page.setRequestInterception(true);
-    page.on('request', (req) => { if (['image','stylesheet','font','media'].includes(req.resourceType())) req.abort(); else req.continue(); });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+    await preparePage(page);
     const targetUrl = lead.placeUrl || `https://www.google.com/maps/search/${encodeURIComponent(lead.name + ' ' + (lead.locationSuffix || ''))}`;
-    await runWithCancellation(jobId, () => page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }));
-    await runWithCancellation(jobId, () => new Promise(r => setTimeout(r, 1500)));
+    await navigateWithRetry(page, targetUrl, jobId, { timeout: 15000, maxAttempts: 2 });
+    await runWithCancellation(jobId, () => new Promise((r) => setTimeout(r, 1500)));
     if (!page.url().includes('/maps/place/')) {
       const first = await page.$('[role="feed"] > div:first-child a[href*="/maps/place/"]');
       if (first) {
